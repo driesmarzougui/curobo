@@ -22,6 +22,10 @@ from curobo._src.perception.mapper.kernel.warp_types import (
 )
 from curobo._src.perception.mapper.kernel.wp_hash import (
     free_list_push,
+    hash_lookup,
+)
+from curobo._src.perception.mapper.kernel.wp_coord import (
+    block_local_to_world,
 )
 from curobo._src.perception.mapper.kernel.wp_integrate_common import (
     quat_from_wxyz_array,
@@ -258,6 +262,10 @@ def decay_and_recycle(
     if decay_factor < 1.0:
         tsdf.data.block_data[:max_blocks].mul_(decay_factor)
         tsdf.data.block_rgb[:max_blocks].mul_(decay_factor)
+        # LOCAL PATCH (grocery_bot): decay per-voxel RGB in lockstep with
+        # block_rgb so the [R·w / W] ratio stays consistent and the colour
+        # doesn't drift relative to confidence.  See tasks/curobo_vendor_patches.md #4.
+        tsdf.data.voxel_rgb[:max_blocks].mul_(decay_factor)
     tsdf.data.block_sums[:max_blocks] = (
         tsdf.data.block_data[:max_blocks, :, 1].sum(dim=1, dtype=torch.float32)
     )
@@ -371,6 +379,8 @@ def decay_frustum_aware_multi_camera(
         if time_decay < 1.0:
             block_data.mul_(time_decay)
             tsdf.data.block_rgb[:n].mul_(time_decay)
+            # LOCAL PATCH (grocery_bot): see tasks/curobo_vendor_patches.md #4.
+            tsdf.data.voxel_rgb[:n].mul_(time_decay)
         tsdf.data.block_sums[:n] = block_data[:, :, 1].sum(
             dim=1, dtype=torch.float32
         )
@@ -430,6 +440,9 @@ def decay_frustum_aware_multi_camera(
 
     tsdf.data.block_data[:n].mul_(factor.view(n, 1, 1))
     tsdf.data.block_rgb[:n].mul_(factor.view(n, 1))
+    # LOCAL PATCH (grocery_bot): decay per-voxel RGB in lockstep with block_rgb.
+    # See tasks/curobo_vendor_patches.md #4.
+    tsdf.data.voxel_rgb[:n].mul_(factor.view(n, 1, 1))
 
     tsdf.data.block_sums[:n] = tsdf.data.block_data[:n, :, 1].sum(
         dim=1, dtype=torch.float32
@@ -438,4 +451,477 @@ def decay_frustum_aware_multi_camera(
     recycle_graph_safe(tsdf, num_blocks=num_blocks)
 
 
+# =============================================================================
+# LOCAL PATCH (grocery_bot): exposure-aware per-voxel decay
+# =============================================================================
+#
+# Replaces the block-level sphere decay for live voxel_project integration.
+# Iterates over every voxel in every ALLOCATED block (not just blocks
+# discovered from current depth rays) and, per voxel:
+#
+#   - exposed (projects inside some camera's image for z_cam > depth_min)
+#       → `block_data[V] *= frustum_decay`
+#   - not exposed (u,v clipped)
+#       → untouched
+#
+# The caller runs this pass **after** `integrate_voxels_kernel` (pure
+# accumulation: `block_data += new_obs`), so observed voxels effectively
+# evolve as `new = (old + obs) * f` (same steady state as upstream).
+#
+# This handles the case the previous patch missed: blocks allocated in a
+# past frame that are no longer near any current depth ray.  Phase 1 of the
+# voxel_project integrator never rediscovers those blocks, so an
+# integrate-kernel-only decay can't touch them — they sit there as phantom
+# voxels in mid-air forever.  Sweeping the full `num_allocated` range here
+# catches those orphan blocks.  See tasks/curobo_vendor_patches.md #2.
 
+
+@wp.kernel
+def decay_voxels_exposure_aware_kernel(
+    # Per-camera
+    intrinsics: wp.array3d(dtype=wp.float32),
+    cam_positions: wp.array2d(dtype=wp.float32),
+    cam_quaternions: wp.array2d(dtype=wp.float32),
+    depth_images: wp.array3d(dtype=wp.float32),
+    n_cameras: wp.int32,
+    img_H: wp.int32,
+    img_W: wp.int32,
+    depth_min: wp.float32,
+    depth_max: wp.float32,
+    # Grid
+    origin: wp.array(dtype=wp.float32),
+    voxel_size: wp.float32,
+    block_size: wp.int32,
+    grid_W: wp.int32,
+    grid_H: wp.int32,
+    grid_D: wp.int32,
+    # Block storage
+    num_allocated: wp.array(dtype=wp.int32),
+    block_coords: wp.array(dtype=wp.int32),
+    block_to_hash_slot: wp.array(dtype=wp.int32),
+    block_data: wp.array3d(dtype=wp.float16),
+    # Decay
+    frustum_decay: wp.float32,
+    # Weight threshold for phantom cleanup — voxels with w < w_threshold
+    # (single-observation noise, partial integrations) decay whenever they
+    # are exposed.
+    w_threshold: wp.float32,
+    # Free-space margin for ray-based carving — a voxel is treated as
+    # being in clear free space (and decayed) if the camera's depth at its
+    # pixel is MORE than `z_cam + free_space_margin` away.  Distinguishes
+    # "voxel briefly out-of-view but the surface has just shifted by a
+    # fraction of a truncation" (preserve) from "voxel where the obstacle
+    # used to be, now clearly gone" (decay).
+    free_space_margin: wp.float32,
+    max_blocks: wp.int32,
+    # Diagnostic counter: [0] = voxels decayed this call, [1] = voxels
+    # with old_w > 0 that were preserved.
+    diag_counts: wp.array(dtype=wp.int32),
+):
+    tid = wp.tid()
+    total_voxels = max_blocks * 512
+    if tid >= total_voxels:
+        return
+
+    block_idx = tid // 512
+    local_idx = tid % 512
+
+    if block_idx >= num_allocated[0]:
+        return
+    if block_to_hash_slot[block_idx] < 0:
+        return
+
+    old_w = wp.float32(block_data[block_idx, local_idx, 1])
+    if old_w <= 0.0:
+        return  # nothing to decay
+
+    bx = block_coords[block_idx * 3 + 0]
+    by = block_coords[block_idx * 3 + 1]
+    bz = block_coords[block_idx * 3 + 2]
+
+    grid_origin = vec3_from_array(origin)
+    voxel_center = block_local_to_world(
+        bx, by, bz, local_idx,
+        grid_origin, voxel_size, block_size,
+        grid_W, grid_H, grid_D,
+    )
+
+    # Four states per camera:
+    #   exposed_free     — voxel is in clear free space of current view
+    #                      (valid depth > z_cam + margin).  Decay candidate.
+    #   exposed_preserve — voxel is near OR behind the current surface.
+    #                      `integrate_voxels_kernel` either touched it or
+    #                      it is occluded — preserve.
+    #   exposed_no_info  — projection lands in bounds but depth is invalid
+    #                      (0 / NaN / <min_z / >max_z / self-masked).  No
+    #                      vote — neither evidence for nor against.  A
+    #                      confirmed voxel survives; a low-weight phantom
+    #                      still falls to the `old_w < w_threshold` clause.
+    #   not_exposed      — projection outside image bounds or too close
+    #                      to the camera.  Preserve (out-of-frustum).
+    # Final decision across cameras: PRESERVE if any camera says so, else
+    # DECAY if any camera says free-space, else preserve (not exposed /
+    # no info).
+    decay_vote = wp.bool(False)
+    preserve_vote = wp.bool(False)
+    exposed_any = wp.bool(False)
+    for cam_i in range(n_cameras):
+        cam_pos = wp.vec3(
+            cam_positions[cam_i, 0],
+            cam_positions[cam_i, 1],
+            cam_positions[cam_i, 2],
+        )
+        cam_quat = wp.quaternion(
+            cam_quaternions[cam_i, 1],
+            cam_quaternions[cam_i, 2],
+            cam_quaternions[cam_i, 3],
+            cam_quaternions[cam_i, 0],
+        )
+        voxel_cam = wp.quat_rotate(
+            wp.quat_inverse(cam_quat), voxel_center - cam_pos
+        )
+        z_cam = voxel_cam[2]
+        if z_cam > depth_min:
+            fx = intrinsics[cam_i, 0, 0]
+            fy = intrinsics[cam_i, 1, 1]
+            cx_i = intrinsics[cam_i, 0, 2]
+            cy_i = intrinsics[cam_i, 1, 2]
+            u = fx * voxel_cam[0] / z_cam + cx_i
+            v = fy * voxel_cam[1] / z_cam + cy_i
+            px = wp.int32(u)
+            py = wp.int32(v)
+            if px >= 0 and px < img_W and py >= 0 and py < img_H:
+                exposed_any = wp.bool(True)
+                depth_val = depth_images[cam_i, py, px]
+                if depth_val >= depth_min and depth_val <= depth_max:
+                    # Valid depth.  Compare voxel z against surface.
+                    if depth_val > z_cam + free_space_margin:
+                        decay_vote = wp.bool(True)  # clear free space
+                    else:
+                        preserve_vote = wp.bool(True)  # near / behind surface
+                # else: depth invalid at the pixel (0 / NaN / <min_z /
+                # >max_z / self-masked).  No vote — treat as "no info".
+                # Confirmed voxels (old_w >= w_threshold) are preserved;
+                # low-weight phantoms still decay via the w_threshold
+                # clause below.  grocery_bot local patch — see
+                # tasks/curobo_vendor_patches.md #2.
+
+    if preserve_vote:
+        if exposed_any:
+            wp.atomic_add(diag_counts, 1, wp.int32(1))
+        return
+    if not exposed_any:
+        return  # fully outside any frustum — preserve silently
+
+    # Exposed without any preserve vote.  Two reasons get here:
+    #   (1) decay_vote = True  → valid depth contradicts the voxel
+    #                            (current view shows free space past it).
+    #   (2) decay_vote = False → depth invalid at the pixel ("no info").
+    # In case (1) we always decay (confirmed voxels too).
+    # In case (2) we decay only below the confirmation threshold — i.e.
+    # low-weight phantoms still get cleaned up, confirmed voxels survive.
+    if decay_vote or old_w < w_threshold:
+        old_sw = wp.float32(block_data[block_idx, local_idx, 0])
+        block_data[block_idx, local_idx, 0] = wp.float16(old_sw * frustum_decay)
+        block_data[block_idx, local_idx, 1] = wp.float16(old_w * frustum_decay)
+        wp.atomic_add(diag_counts, 0, wp.int32(1))
+    else:
+        wp.atomic_add(diag_counts, 1, wp.int32(1))
+
+
+def decay_voxels_exposure_aware(
+    tsdf,
+    intrinsics: torch.Tensor,
+    cam_positions: torch.Tensor,
+    cam_quaternions: torch.Tensor,
+    depth_images: torch.Tensor,
+    depth_min: float,
+    depth_max: float,
+    frustum_decay: float,
+    img_H: int,
+    img_W: int,
+    w_threshold: float = 0.6,
+    free_space_margin: float = 0.15,
+):
+    """Apply per-voxel exposure-gated decay to every allocated block.
+
+    Must be called AFTER ``integrate_voxels_kernel`` (which writes
+    ``block_data += obs``).  This pass then multiplies exposed voxels by
+    ``frustum_decay``, giving ``(old + obs) * f`` for observed voxels and
+    ``old * f`` for exposed-but-not-observed voxels.  Voxels outside the
+    current frustum (u,v clipped) are left untouched.
+
+    Also refreshes ``block_sums`` and calls ``recycle_graph_safe`` so
+    empty blocks are reclaimed into the free list.
+
+    Args:
+        tsdf: BlockSparseTSDF instance.
+        intrinsics: ``(num_cameras, 3, 3)`` float32.
+        cam_positions: ``(num_cameras, 3)`` float32.
+        cam_quaternions: ``(num_cameras, 4)`` float32, wxyz.
+        depth_min: Minimum valid depth [m] (shared across cameras).
+        frustum_decay: Decay factor in (0, 1].  ``1.0`` = no-op.
+        img_H, img_W: Image dimensions (shared across cameras).
+    """
+    max_blocks = tsdf.config.max_blocks
+    n_cameras = intrinsics.shape[0]
+    check_float32_tensors(
+        intrinsics.device,
+        intrinsics=intrinsics,
+        cam_positions=cam_positions,
+        cam_quaternions=cam_quaternions,
+    )
+
+    data = tsdf.get_warp_data()
+    device, stream = get_warp_device_stream(tsdf.data.block_data)
+
+    if tsdf.config.grid_shape is not None:
+        grid_D, grid_H_dim, grid_W_dim = tsdf.config.grid_shape
+    else:
+        grid_W_dim, grid_H_dim, grid_D = 0, 0, 0
+
+    # Diagnostic counter: [0] = voxels decayed this call, [1] = preserved.
+    # Stashed on the tsdf so callers (e.g. voxel_updater) can read it.
+    if not hasattr(tsdf, "_decay_diag_counts"):
+        tsdf._decay_diag_counts = torch.zeros(
+            2, dtype=torch.int32, device=tsdf.data.block_data.device,
+        )
+    tsdf._decay_diag_counts.zero_()
+
+    wp.launch(
+        decay_voxels_exposure_aware_kernel,
+        dim=max_blocks * 512,
+        inputs=[
+            wp.from_torch(intrinsics, dtype=wp.float32),
+            wp.from_torch(cam_positions, dtype=wp.float32),
+            wp.from_torch(cam_quaternions, dtype=wp.float32),
+            wp.from_torch(depth_images, dtype=wp.float32),
+            n_cameras,
+            img_H,
+            img_W,
+            float(depth_min),
+            float(depth_max),
+            wp.from_torch(tsdf.config.origin, dtype=wp.float32),
+            tsdf.config.voxel_size,
+            tsdf.config.block_size,
+            grid_W_dim,
+            grid_H_dim,
+            grid_D,
+            data.num_allocated,
+            data.block_coords,
+            data.block_to_hash_slot,
+            data.block_data,
+            wp.float32(frustum_decay),
+            wp.float32(w_threshold),
+            wp.float32(free_space_margin),
+            max_blocks,
+            wp.from_torch(tsdf._decay_diag_counts, dtype=wp.int32),
+        ],
+        device=device,
+        stream=stream,
+    )
+
+    # Refresh block_sums for downstream recycling.
+    n = int(tsdf.data.num_allocated.item())
+    if n > 0:
+        tsdf.data.block_sums[:n] = tsdf.data.block_data[:n, :, 1].sum(
+            dim=1, dtype=torch.float32
+        )
+        recycle_graph_safe(tsdf, num_blocks=n)
+
+
+# =============================================================================
+# Isolated-Voxel Decay (grocery_bot local patch — patch #3)
+# =============================================================================
+#
+# Motivation.  The exposure-aware sweep above preserves any voxel whose
+# projected pixel is in the robot's self-mask region or otherwise gives
+# invalid depth — this is correct for confirmed obstacles behind the
+# gripper but it also preserves stray single-voxel phantoms that were
+# created by a one-off depth-noise spike and then became permanently
+# occluded by the arm geometry.  The exposure-aware kernel has no way to
+# carve them because branch (a) (valid depth > z_cam + margin) needs a
+# valid depth reading past the voxel, which never arrives.
+#
+# Phantoms of this kind have a distinctive morphology: they sit alone in
+# mid-air with 0–2 occupied neighbours in the 26-connected neighbourhood.
+# Real surfaces at our voxel scale (5 cm) are always much thicker than a
+# single voxel layer — the TSDF truncation band extends ±3 voxels
+# perpendicular to any surface, so even a bottle-cap voxel has 9+
+# occupied neighbours from the bottle body and rim beneath it.  The
+# kernel below sweeps every allocated voxel and decays the ones with
+# ≤ `neighbor_threshold` occupied neighbours, skipping steady-state
+# voxels (`w > w_protect`) so well-observed geometry is safe even if it
+# happens to sit at a block corner with low connectivity temporarily.
+#
+# See tasks/curobo_vendor_patches.md #3.
+
+
+@wp.kernel
+def decay_isolated_voxels_kernel(
+    # Block storage
+    num_allocated: wp.array(dtype=wp.int32),
+    block_coords: wp.array(dtype=wp.int32),
+    block_to_hash_slot: wp.array(dtype=wp.int32),
+    block_data: wp.array3d(dtype=wp.float16),
+    hash_table: wp.array(dtype=wp.int64),
+    hash_capacity: wp.int32,
+    # Decay
+    frustum_decay: wp.float32,
+    # Safety belts.
+    w_protect: wp.float32,    # skip voxels with w > this (confirmed geometry)
+    w_occupied: wp.float32,   # neighbour counts as occupied iff w > this
+    neighbor_threshold: wp.int32,  # decay iff occupied_count <= this
+    max_blocks: wp.int32,
+    diag_counts: wp.array(dtype=wp.int32),  # [0] = decayed, [1] = preserved
+):
+    tid = wp.tid()
+    total_voxels = max_blocks * 512
+    if tid >= total_voxels:
+        return
+
+    block_idx = tid // 512
+    local_idx = tid % 512
+
+    if block_idx >= num_allocated[0]:
+        return
+    if block_to_hash_slot[block_idx] < 0:
+        return
+
+    old_w = wp.float32(block_data[block_idx, local_idx, 1])
+    if old_w <= w_occupied:
+        return  # empty / effectively empty
+    if old_w > w_protect:
+        return  # confirmed — safety belt 1
+
+    # Decompose local_idx into (lx, ly, lz) — local_idx = lz * 64 + ly * 8 + lx
+    lz = local_idx // 64
+    rem = local_idx - lz * 64
+    ly = rem // 8
+    lx = rem - ly * 8
+
+    bx = block_coords[block_idx * 3 + 0]
+    by = block_coords[block_idx * 3 + 1]
+    bz = block_coords[block_idx * 3 + 2]
+
+    n_occupied = wp.int32(0)
+
+    # 26-connected neighbourhood — iterate over {-1, 0, 1}³ skipping (0, 0, 0).
+    for dx in range(-1, 2):
+        for dy in range(-1, 2):
+            for dz in range(-1, 2):
+                if dx == 0 and dy == 0 and dz == 0:
+                    continue
+
+                nlx = lx + dx
+                nly = ly + dy
+                nlz = lz + dz
+                nbx = bx
+                nby = by
+                nbz = bz
+
+                # Cross block boundary when local coord goes out of [0, 8).
+                if nlx < 0:
+                    nlx = nlx + 8
+                    nbx = nbx - 1
+                if nlx >= 8:
+                    nlx = nlx - 8
+                    nbx = nbx + 1
+                if nly < 0:
+                    nly = nly + 8
+                    nby = nby - 1
+                if nly >= 8:
+                    nly = nly - 8
+                    nby = nby + 1
+                if nlz < 0:
+                    nlz = nlz + 8
+                    nbz = nbz - 1
+                if nlz >= 8:
+                    nlz = nlz - 8
+                    nbz = nbz + 1
+
+                neighbor_local_idx = nlz * 64 + nly * 8 + nlx
+
+                if nbx == bx and nby == by and nbz == bz:
+                    neighbor_block_idx = block_idx
+                else:
+                    neighbor_block_idx = hash_lookup(
+                        hash_table, nbx, nby, nbz, hash_capacity,
+                    )
+                    if neighbor_block_idx < 0:
+                        continue  # neighbour block not allocated → empty
+
+                neighbor_w = wp.float32(
+                    block_data[neighbor_block_idx, neighbor_local_idx, 1]
+                )
+                if neighbor_w > w_occupied:
+                    n_occupied = n_occupied + 1
+
+    if n_occupied <= neighbor_threshold:
+        old_sw = wp.float32(block_data[block_idx, local_idx, 0])
+        block_data[block_idx, local_idx, 0] = wp.float16(old_sw * frustum_decay)
+        block_data[block_idx, local_idx, 1] = wp.float16(old_w * frustum_decay)
+        wp.atomic_add(diag_counts, 0, wp.int32(1))
+    else:
+        wp.atomic_add(diag_counts, 1, wp.int32(1))
+
+
+def decay_isolated_voxels(
+    tsdf,
+    frustum_decay: float,
+    w_protect: float = 0.95,
+    w_occupied: float = 0.1,
+    neighbor_threshold: int = 2,
+):
+    """Decay voxels whose 26-neighbourhood is sparse.
+
+    Intended to run AFTER ``decay_voxels_exposure_aware`` as a final
+    cleanup pass for orphan phantoms in permanently-occluded regions.
+    See the block comment at the top of this section.
+
+    Args:
+        tsdf: BlockSparseTSDF instance.
+        frustum_decay: Multiplier applied to matching voxels (same factor
+            used by the exposure-aware sweep).  ``1.0`` = no-op.
+        w_protect: Voxels with weight > this are preserved unconditionally
+            (safety belt: confirmed geometry is not re-examined).
+        w_occupied: Weight threshold for counting a neighbour as occupied.
+            Should match the visualisation / ESDF seeding threshold so
+            what the kernel calls "occupied" matches what the user sees.
+        neighbor_threshold: Voxels with ≤ this many occupied neighbours are
+            decayed.  Default 2 catches isolated voxels and 2- or 3-voxel
+            clusters; real surfaces at our voxel scale have ≥ 6.
+    """
+    if frustum_decay >= 1.0:
+        return
+
+    max_blocks = tsdf.config.max_blocks
+    data = tsdf.get_warp_data()
+    device, stream = get_warp_device_stream(tsdf.data.block_data)
+
+    if not hasattr(tsdf, "_isolated_diag_counts"):
+        tsdf._isolated_diag_counts = torch.zeros(
+            2, dtype=torch.int32, device=tsdf.data.block_data.device,
+        )
+    tsdf._isolated_diag_counts.zero_()
+
+    wp.launch(
+        decay_isolated_voxels_kernel,
+        dim=max_blocks * 512,
+        inputs=[
+            data.num_allocated,
+            data.block_coords,
+            data.block_to_hash_slot,
+            data.block_data,
+            data.hash_table,
+            tsdf.config.hash_capacity,
+            wp.float32(frustum_decay),
+            wp.float32(w_protect),
+            wp.float32(w_occupied),
+            wp.int32(neighbor_threshold),
+            max_blocks,
+            wp.from_torch(tsdf._isolated_diag_counts, dtype=wp.int32),
+        ],
+        device=device,
+        stream=stream,
+    )

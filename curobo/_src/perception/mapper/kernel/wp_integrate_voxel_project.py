@@ -194,6 +194,18 @@ def integrate_voxels_kernel(
     block_coords: wp.array(dtype=wp.int32),
     block_data: wp.array3d(dtype=wp.float16),
     block_rgb: wp.array2d(dtype=wp.float32),
+    # LOCAL PATCH (grocery_bot): per-voxel RGB accumulator — mirrors block_rgb
+    # but indexed by (pool_idx, local_idx).  See tasks/curobo_vendor_patches.md #4.
+    voxel_rgb: wp.array3d(dtype=wp.float32),
+    # LOCAL PATCH (grocery_bot): observation-gated inline decay.  When
+    # total_w > 0 (voxel got a valid near-surface depth hit this frame),
+    # `block_data` is written as ``(old + new) * frustum_decay``.  Voxels
+    # that don't receive an observation are left untouched here — the
+    # post-integrate sweep `decay_voxels_exposure_aware_kernel` handles
+    # them with a weight-threshold gate to catch phantoms while preserving
+    # confirmed obstacles during camera transit.  See
+    # tasks/curobo_vendor_patches.md #2.
+    frustum_decay: wp.float32,
 ):
     """Voxel-centric integration across multiple cameras.
 
@@ -270,9 +282,16 @@ def integrate_voxels_kernel(
                     sdf = depth - z_cam
                     if sdf >= -truncation_dist:
                         sdf_clamped = wp.min(sdf, truncation_dist)
-                        base_weight = compute_tsdf_weight(depth, voxel_size)
-                        coverage = (fx * voxel_size / z_cam) * (fy * voxel_size / z_cam)
-                        weight = base_weight * wp.max(coverage, 1.0)
+                        # LOCAL PATCH (grocery_bot): drop the coverage multiplier.
+                        # Upstream (v0.8.0) uses `weight = base_weight * max(coverage, 1.0)`
+                        # with coverage = (fx * vs / z_cam)^2 (projected voxel area in
+                        # pixels^2). On our setup (fx≈920, vs=5cm) that's ~2000/hit at
+                        # z=1 m — a single depth-noise spike then sits far above
+                        # minimum_tsdf_weight for tens of seconds and paints the
+                        # frustum. See tasks/lessons.md / voxel plan. Keep weight at
+                        # base_weight (= 1.0/hit from compute_tsdf_weight) so the
+                        # threshold has "number of consistent observations" semantics.
+                        weight = compute_tsdf_weight(depth, voxel_size)
 
                         total_sw = total_sw + sdf_clamped * weight
                         total_w = total_w + weight
@@ -285,13 +304,26 @@ def integrate_voxels_kernel(
     if total_w > 0.0:
         old_sw = wp.float32(block_data[pool_idx, local_idx, 0])
         old_w = wp.float32(block_data[pool_idx, local_idx, 1])
-        block_data[pool_idx, local_idx, 0] = wp.float16(old_sw + total_sw)
-        block_data[pool_idx, local_idx, 1] = wp.float16(old_w + total_w)
+        # LOCAL PATCH (grocery_bot): apply frustum_decay inline on the
+        # observed voxel (same formula as upstream's decay-then-integrate:
+        # (old + new) * f gives the same w_ss = f/(1-f) steady state).
+        block_data[pool_idx, local_idx, 0] = wp.float16((old_sw + total_sw) * frustum_decay)
+        block_data[pool_idx, local_idx, 1] = wp.float16((old_w + total_w) * frustum_decay)
 
         wp.atomic_add(block_rgb, pool_idx, 0, total_rw)
         wp.atomic_add(block_rgb, pool_idx, 1, total_gw)
         wp.atomic_add(block_rgb, pool_idx, 2, total_bw)
         wp.atomic_add(block_rgb, pool_idx, 3, total_w)
+
+        # LOCAL PATCH (grocery_bot): mirror into per-voxel accumulator so the
+        # extract kernels can return per-voxel colour instead of block-average.
+        # Contention is lower than block-level (one thread per voxel writes
+        # into its own slot; only same-voxel multi-camera hits contend).
+        # See tasks/curobo_vendor_patches.md #4.
+        wp.atomic_add(voxel_rgb, pool_idx, local_idx, 0, total_rw)
+        wp.atomic_add(voxel_rgb, pool_idx, local_idx, 1, total_gw)
+        wp.atomic_add(voxel_rgb, pool_idx, local_idx, 2, total_bw)
+        wp.atomic_add(voxel_rgb, pool_idx, local_idx, 3, total_w)
 
 
 # =============================================================================
@@ -348,6 +380,7 @@ class VoxelProjectIntegrator:
         depth_min: float = 0.1,
         depth_max: float = 5.0,
         grid_size: tuple = None,
+        frustum_decay: float = 1.0,
     ):
         """Integrate depth from one or more cameras using batched kernels.
 
@@ -361,6 +394,8 @@ class VoxelProjectIntegrator:
             depth_min: Minimum valid depth.
             depth_max: Maximum valid depth.
             grid_size: Optional (nz, ny, nx) for bounds.
+            frustum_decay: LOCAL PATCH — inline decay for observed voxels.
+                ``1.0`` = no decay (upstream behaviour).
         """
         tsdf.prepare_frame()
 
@@ -453,6 +488,9 @@ class VoxelProjectIntegrator:
             inputs=[
                 data.block_data,
                 data.block_rgb,
+                # LOCAL PATCH (grocery_bot): also zero per-voxel RGB for newly
+                # allocated blocks.  See tasks/curobo_vendor_patches.md #4.
+                data.voxel_rgb,
                 data.new_blocks,
                 data.new_block_count,
                 tsdf.config.max_blocks,
@@ -491,6 +529,9 @@ class VoxelProjectIntegrator:
                 data.block_coords,
                 data.block_data,
                 data.block_rgb,
+                # LOCAL PATCH (grocery_bot): per-voxel RGB accumulator.
+                data.voxel_rgb,
+                wp.float32(frustum_decay),
             ],
             device=device,
             stream=stream,

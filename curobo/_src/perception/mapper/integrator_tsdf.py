@@ -33,6 +33,8 @@ from curobo._src.perception.mapper.kernel.warp_types import BLOCK_SIZE
 from curobo._src.perception.mapper.kernel.wp_decay import (
     decay_and_recycle,
     decay_frustum_aware_multi_camera,
+    decay_isolated_voxels,
+    decay_voxels_exposure_aware,
 )
 from curobo._src.perception.mapper.kernel.wp_integrate_sort_filter import (
     SortFilterIntegrator,
@@ -258,6 +260,27 @@ class BlockSparseTSDFIntegrator:
         quaternions = observation.pose.quaternion.view(n_cameras, 4)
         intrinsics = observation.intrinsics
 
+        # LOCAL PATCH (grocery_bot): two-stage decay.
+        # Stage 1 — `integrate_voxels_kernel` applies `frustum_decay` inline
+        # only on voxels that received a fresh depth observation this frame
+        # (total_w > 0): `block_data = (old + new) * f`.  Observed voxels
+        # reach steady state `w_ss = f/(1-f)` = 1.0 @ f=0.5.
+        # Stage 2 — `decay_voxels_exposure_aware` sweeps every allocated
+        # block and applies the same `frustum_decay` to voxels that are
+        # exposed (project inside an image) AND have `w < w_threshold`
+        # (unconfirmed — likely phantoms).  Voxels with `w >= w_threshold`
+        # are treated as confirmed and preserved through camera transit,
+        # which fixes the "left disappears when I rotate right" symptom.
+        # Phantoms at w=0.5 fall below threshold and decay to zero in ~4
+        # frames.
+        # See tasks/curobo_vendor_patches.md #2.
+        integrate_kwargs = dict(
+            depth_min=self.config.depth_minimum_distance,
+            depth_max=self.config.depth_maximum_distance,
+            grid_size=self.config.grid_shape,
+        )
+        if self.config.integration_method == "voxel_project":
+            integrate_kwargs["frustum_decay"] = self.config.frustum_decay
         self._integrator.integrate(
             self._tsdf,
             depth_images,
@@ -265,16 +288,56 @@ class BlockSparseTSDFIntegrator:
             positions,
             quaternions,
             intrinsics,
-            depth_min=self.config.depth_minimum_distance,
-            depth_max=self.config.depth_maximum_distance,
-            grid_size=self.config.grid_shape,
+            **integrate_kwargs,
         )
 
-        if self.config.time_decay < 1.0 or self.config.frustum_decay < 1.0:
-            img_shape = (depth_images.shape[1], depth_images.shape[2])
-            num_blocks = None
-            if self.config.integration_method == "voxel_project":
-                num_blocks = int(self._tsdf.data.num_allocated.item())
+        img_shape = (depth_images.shape[1], depth_images.shape[2])
+        if self.config.integration_method == "voxel_project":
+            if self.config.frustum_decay < 1.0:
+                decay_voxels_exposure_aware(
+                    self._tsdf,
+                    intrinsics=intrinsics,
+                    cam_positions=positions,
+                    cam_quaternions=quaternions,
+                    depth_images=depth_images,
+                    depth_min=self.config.depth_minimum_distance,
+                    depth_max=self.config.depth_maximum_distance,
+                    frustum_decay=self.config.frustum_decay,
+                    img_H=img_shape[0],
+                    img_W=img_shape[1],
+                )
+                # LOCAL PATCH (grocery_bot) #3: isolated-voxel sweep.
+                # Orphan phantoms that sit in permanently-occluded regions
+                # (behind the arm / gripper) are preserved by the exposure-
+                # aware sweep above because their projected pixels always
+                # read invalid depth (self-mask) — they never get a chance
+                # to fall to branch (a) free-space carving.  This pass
+                # carves them via geometric connectivity instead: a voxel
+                # with ≤ 2 occupied 26-neighbours is almost certainly
+                # noise at our voxel scale.  Confirmed voxels (w > 0.95)
+                # are skipped unconditionally.
+                decay_isolated_voxels(
+                    self._tsdf,
+                    frustum_decay=self.config.frustum_decay,
+                    w_protect=0.95,
+                    w_occupied=self.config.minimum_tsdf_weight,
+                    neighbor_threshold=2,
+                )
+            if self.config.time_decay < 1.0:
+                # Fast path: global time-decay + sums refresh + recycle.
+                decay_frustum_aware_multi_camera(
+                    self._tsdf,
+                    intrinsics=intrinsics,
+                    cam_positions=positions,
+                    cam_quaternions=quaternions,
+                    img_shape=img_shape,
+                    depth_minimum_distance=self.config.depth_minimum_distance,
+                    depth_maximum_distance=self.config.depth_maximum_distance,
+                    time_decay=self.config.time_decay,
+                    frustum_decay=1.0,
+                    num_blocks=int(self._tsdf.data.num_allocated.item()),
+                )
+        elif self.config.time_decay < 1.0 or self.config.frustum_decay < 1.0:
             decay_frustum_aware_multi_camera(
                 self._tsdf,
                 intrinsics=intrinsics,
@@ -285,7 +348,7 @@ class BlockSparseTSDFIntegrator:
                 depth_maximum_distance=self.config.depth_maximum_distance,
                 time_decay=self.config.time_decay,
                 frustum_decay=self.config.frustum_decay,
-                num_blocks=num_blocks,
+                num_blocks=None,
             )
 
         self._frame_count += 1

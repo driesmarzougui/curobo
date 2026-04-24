@@ -246,6 +246,48 @@ def compute_avg_rgb_uint8_from_block(
     return wp.vec3i(r, g, b)
 
 
+@wp.func
+def compute_avg_rgb_uint8_from_voxel(
+    voxel_rgb: wp.array3d(dtype=wp.float32),
+    block_rgb: wp.array2d(dtype=wp.float32),
+    pool_idx: wp.int32,
+    local_idx: wp.int32,
+) -> wp.vec3i:
+    """LOCAL PATCH (grocery_bot): per-voxel averaged RGB with block fallback.
+
+    Returns the averaged colour for a single voxel from the per-voxel
+    accumulator.  When the voxel has no per-voxel observations (weight < ε —
+    e.g. produced by a code path that only writes the block-level accumulator,
+    such as ``sort_filter`` integration or ``stamp_obstacles``), falls back to
+    the block-average so existing callers stay visually correct.
+
+    See tasks/curobo_vendor_patches.md #4.
+
+    Args:
+        voxel_rgb: Per-voxel array with [R×w, G×w, B×w, W] in last dim.
+        block_rgb: Per-block fallback with same layout.
+        pool_idx: Block pool index.
+        local_idx: Voxel index within block (0..511).
+
+    Returns:
+        vec3i(R, G, B) with values in 0-255 range.
+    """
+    r_sum = voxel_rgb[pool_idx, local_idx, 0]
+    g_sum = voxel_rgb[pool_idx, local_idx, 1]
+    b_sum = voxel_rgb[pool_idx, local_idx, 2]
+    w = voxel_rgb[pool_idx, local_idx, 3]
+
+    if w < 1e-6:
+        # Fallback to block-level average for sort_filter / stamp_obstacles paths.
+        return compute_avg_rgb_uint8_from_block(block_rgb, pool_idx)
+
+    inv_w = 1.0 / w
+    r = wp.int32(wp.clamp(r_sum * inv_w, 0.0, 255.0))
+    g = wp.int32(wp.clamp(g_sum * inv_w, 0.0, 255.0))
+    b = wp.int32(wp.clamp(b_sum * inv_w, 0.0, 255.0))
+    return wp.vec3i(r, g, b)
+
+
 # =============================================================================
 # Hash Table Lookup
 # =============================================================================
@@ -680,6 +722,9 @@ def write_tsdf_voxel(
 def clear_new_blocks_kernel(
     block_data: wp.array3d(dtype=wp.float16),
     block_rgb: wp.array2d(dtype=wp.float32),  # Per-block [R×w, G×w, B×w, W]
+    # LOCAL PATCH (grocery_bot): per-voxel RGB accumulator also needs clearing
+    # when a block is (re)allocated.  See tasks/curobo_vendor_patches.md #4.
+    voxel_rgb: wp.array3d(dtype=wp.float32),  # Per-voxel [R×w, G×w, B×w, W]
     new_blocks: wp.array(dtype=wp.int32),
     new_block_count: wp.array(dtype=wp.int32),
     max_blocks: wp.int32,
@@ -703,6 +748,12 @@ def clear_new_blocks_kernel(
     # Clear TSDF data - 3D indexing: [pool_idx, local_idx, channel]
     block_data[pool_idx, local_idx, 0] = wp.float16(0.0)
     block_data[pool_idx, local_idx, 1] = wp.float16(0.0)
+
+    # LOCAL PATCH (grocery_bot): clear per-voxel RGBW (each thread clears its own slot).
+    voxel_rgb[pool_idx, local_idx, 0] = 0.0
+    voxel_rgb[pool_idx, local_idx, 1] = 0.0
+    voxel_rgb[pool_idx, local_idx, 2] = 0.0
+    voxel_rgb[pool_idx, local_idx, 3] = 0.0
 
     # Clear per-block RGBW (only first thread per block)
     if local_idx == 0:

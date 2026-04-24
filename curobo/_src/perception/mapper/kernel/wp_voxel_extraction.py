@@ -15,7 +15,10 @@ import warp as wp
 
 from curobo._src.perception.mapper.kernel.warp_types import BlockSparseTSDFWarp
 from curobo._src.perception.mapper.kernel.wp_coord import voxel_to_world
-from curobo._src.perception.mapper.kernel.wp_hash import compute_avg_rgb_uint8_from_block
+from curobo._src.perception.mapper.kernel.wp_hash import (
+    # LOCAL PATCH (grocery_bot): per-voxel RGB (tasks/curobo_vendor_patches.md #4).
+    compute_avg_rgb_uint8_from_voxel,
+)
 from curobo._src.perception.mapper.kernel.wp_raycast_common import sample_voxel
 from curobo._src.util.warp import get_warp_device_stream, init_warp
 
@@ -179,8 +182,11 @@ def extract_occupied_voxels_kernel(
     out_centers[slot, 1] = world_pos[1]
     out_centers[slot, 2] = world_pos[2]
 
-    # Read per-block RGB and compute average
-    rgb = compute_avg_rgb_uint8_from_block(tsdf.block_rgb, block_idx)
+    # LOCAL PATCH (grocery_bot): per-voxel RGB with block-level fallback for
+    # code paths that don't populate voxel_rgb.  See tasks/curobo_vendor_patches.md #4.
+    rgb = compute_avg_rgb_uint8_from_voxel(
+        tsdf.voxel_rgb, tsdf.block_rgb, block_idx, local_idx
+    )
     out_colors[slot, 0] = wp.uint8(rgb[0])
     out_colors[slot, 1] = wp.uint8(rgb[1])
     out_colors[slot, 2] = wp.uint8(rgb[2])
@@ -252,8 +258,11 @@ def extract_surface_voxels_kernel(
 
     out_sdf[slot] = sdf
 
-    # Read per-block RGB and compute average
-    rgb = compute_avg_rgb_uint8_from_block(tsdf.block_rgb, block_idx)
+    # LOCAL PATCH (grocery_bot): per-voxel RGB with block-level fallback.
+    # See tasks/curobo_vendor_patches.md #4.
+    rgb = compute_avg_rgb_uint8_from_voxel(
+        tsdf.voxel_rgb, tsdf.block_rgb, block_idx, local_idx
+    )
     out_colors[slot, 0] = wp.uint8(rgb[0])
     out_colors[slot, 1] = wp.uint8(rgb[1])
     out_colors[slot, 2] = wp.uint8(rgb[2])

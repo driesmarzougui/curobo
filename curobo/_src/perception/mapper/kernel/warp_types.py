@@ -70,6 +70,12 @@ class BlockSparseTSDFWarp:
     # Block pool - dynamic channel (depth integration)
     block_data: wp.array3d(dtype=wp.float16)  # (max_blocks, 512, 2) or (1, 1, 2) dummy
     block_rgb: wp.array2d(dtype=wp.float32)  # (max_blocks, 4) per-block [R×w, G×w, B×w, W]
+    # LOCAL PATCH (grocery_bot): per-voxel RGB accumulator.  Same weighted-sum
+    # layout as block_rgb but per voxel → 512× finer colour granularity.  Only
+    # populated by voxel_project integration; sort_filter / stamp_obstacles
+    # still write the block-level accumulator above.  Extract kernels fall back
+    # to block_rgb when voxel weight < epsilon.  See tasks/curobo_vendor_patches.md #4.
+    voxel_rgb: wp.array3d(dtype=wp.float32)  # (max_blocks, 512, 4) per-voxel [R×w, G×w, B×w, W]
 
     # Block pool - static channel (primitive SDF)
     static_block_data: wp.array2d(dtype=wp.float16)  # (max_blocks, 512) or (1, 1) dummy

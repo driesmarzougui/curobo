@@ -131,6 +131,8 @@ class BlockSparseTSDFData:
     # Block pool - packed voxel data (3D for Warp INT32_MAX compatibility)
     block_data: torch.Tensor  # (max_blocks, 512, 2) float16 or (1, 1, 2) dummy
     block_rgb: torch.Tensor  # (max_blocks, 4) float32 - per-block [R×w, G×w, B×w, W]
+    # LOCAL PATCH (grocery_bot): per-voxel RGB accumulator (tasks/curobo_vendor_patches.md #4).
+    voxel_rgb: torch.Tensor  # (max_blocks, 512, 4) float32 - per-voxel [R×w, G×w, B×w, W]
 
     # Static SDF channel (separate tensor for primitives)
     static_block_data: torch.Tensor  # (max_blocks, 512) float16 or (1, 1) dummy
@@ -190,6 +192,8 @@ class BlockSparseTSDFData:
         # Block pool - dynamic channel
         s.block_data = wp.from_torch(self.block_data, dtype=wp.float16)
         s.block_rgb = wp.from_torch(self.block_rgb, dtype=wp.float32)  # Per-block weighted sums
+        # LOCAL PATCH (grocery_bot): per-voxel weighted sums (tasks/curobo_vendor_patches.md #4).
+        s.voxel_rgb = wp.from_torch(self.voxel_rgb, dtype=wp.float32)
 
         # Block pool - static channel
         s.static_block_data = wp.from_torch(self.static_block_data, dtype=wp.float16)
@@ -339,6 +343,17 @@ class BlockSparseTSDF:
             # Divide by channel 3 (weight_sum) at read time for averaging
             block_rgb=torch.zeros(
                 (config.max_blocks, 4),
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            # LOCAL PATCH (grocery_bot): per-voxel RGBW accumulator.  Enables
+            # per-voxel colour at extract time for voxel_project integration.
+            # ~8 KB per block (16 MB at 2k active / 80 MB at 10k); callers that
+            # don't touch RGB (sort_filter, stamp_obstacles) leave this at zero
+            # and the extract helper falls back to block_rgb.
+            # See tasks/curobo_vendor_patches.md #4.
+            voxel_rgb=torch.zeros(
+                (config.max_blocks, 512, 4),
                 dtype=torch.float32,
                 device=self.device,
             ),
@@ -589,6 +604,7 @@ class BlockSparseTSDF:
         total += self._data.hash_table.numel() * 8  # int64 (packed key+value)
         total += self._data.block_data.numel() * 2  # float16
         total += self._data.block_rgb.numel() * 4  # float32
+        total += self._data.voxel_rgb.numel() * 4  # float32 (per-voxel RGB, grocery_bot patch)
         total += self._data.static_block_data.numel() * 2  # float16
         total += self._data.block_coords.numel() * 4  # int32
         total += self._data.block_to_hash_slot.numel() * 4  # int32
