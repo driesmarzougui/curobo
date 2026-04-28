@@ -102,6 +102,16 @@ class BlockSparseTSDFIntegratorCfg:
     depth_maximum_distance: float = 5.0
     frustum_decay: float = 1.0  # 1.0 = no extra decay for in-view voxels
     time_decay: float = 1.0  # 1.0 = no time decay
+    # LOCAL PATCH (grocery_bot) #6: soft decay applied to confirmed voxels
+    # (w >= w_threshold) stuck on persistent no-info in the exposure-aware
+    # decay sweep.  Default 0.95 drains confirmed phantoms in regions
+    # where the depth source can't see (textureless pegboard, ZED reading
+    # 0/NaN) below minimum_tsdf_weight=0.1 over ~4.5 s @ 10 Hz integrate.
+    # Set to 1.0 to disable (strict patch #2 behaviour — confirmed voxels
+    # preserved indefinitely under no-info).  Real obstacles re-observed
+    # every tick are unaffected (they never enter the no-info branch).
+    # See tasks/curobo_vendor_patches.md #6.
+    novote_soft_decay: float = 0.95
     minimum_tsdf_weight: float = 0.1
     grid_shape: Optional[Tuple[int, int, int]] = None  # Optional bounds checking
     roughness: float = 3.0  # Geometric complexity multiplier
@@ -294,6 +304,12 @@ class BlockSparseTSDFIntegrator:
         img_shape = (depth_images.shape[1], depth_images.shape[2])
         if self.config.integration_method == "voxel_project":
             if self.config.frustum_decay < 1.0:
+                # Note: no `depth_max=` kwarg.  The decay kernel uses its
+                # own wider sanity cap (FREE_SPACE_SANITY_MAX_DEPTH_M in
+                # wp_decay.py, 10 m) so valid readings past the integrator's
+                # depth_max still count as free-space evidence.
+                # grocery_bot local patch #5 — see
+                # tasks/curobo_vendor_patches.md.
                 decay_voxels_exposure_aware(
                     self._tsdf,
                     intrinsics=intrinsics,
@@ -301,10 +317,10 @@ class BlockSparseTSDFIntegrator:
                     cam_quaternions=quaternions,
                     depth_images=depth_images,
                     depth_min=self.config.depth_minimum_distance,
-                    depth_max=self.config.depth_maximum_distance,
                     frustum_decay=self.config.frustum_decay,
                     img_H=img_shape[0],
                     img_W=img_shape[1],
+                    novote_soft_decay=self.config.novote_soft_decay,
                 )
                 # LOCAL PATCH (grocery_bot) #3: isolated-voxel sweep.
                 # Orphan phantoms that sit in permanently-occluded regions

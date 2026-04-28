@@ -121,6 +121,9 @@ class BlockSparseESDFIntegratorCfg:
     depth_maximum_distance: float = 5.0
     frustum_decay: float = 0.5
     time_decay: float = 1.0
+    # LOCAL PATCH (grocery_bot) #6: see BlockSparseTSDFIntegratorCfg for
+    # full description.  Plumbed through to the inner TSDF integrator.
+    novote_soft_decay: float = 0.95
     minimum_tsdf_weight: float = 0.1
     blend_esdf: bool = False
     use_cuda_graph: bool = True
@@ -211,6 +214,7 @@ class BlockSparseESDFIntegrator:
             depth_maximum_distance=config.depth_maximum_distance,
             frustum_decay=config.frustum_decay,
             time_decay=config.time_decay,
+            novote_soft_decay=config.novote_soft_decay,
             minimum_tsdf_weight=config.minimum_tsdf_weight,
             grid_shape=config.grid_shape,
             image_height=config.image_height,

@@ -79,6 +79,13 @@ class MapperCfg:
     # === Decay ===
     decay_factor: float = 1.0
     frustum_decay_factor: float = 1.0
+    # LOCAL PATCH (grocery_bot) #6: soft decay on confirmed voxels stuck
+    # in persistent no-info regions of the exposure-aware decay sweep.
+    # Default 0.95 drains confirmed phantoms below minimum_tsdf_weight=0.1
+    # in ~45 ticks (~4.5 s @ 10 Hz).  Set to 1.0 to disable (strict patch
+    # #2 behaviour).  Real obstacles re-observed every tick are
+    # unaffected.  See tasks/curobo_vendor_patches.md #6.
+    novote_soft_decay_factor: float = 0.95
 
     # === RGB ===
     rgb_scale: int = 1
@@ -148,6 +155,11 @@ class MapperCfg:
             raise ValueError(f"decay_factor must be in (0, 1]: {self.decay_factor}")
         if not (0.0 < self.frustum_decay_factor <= 1.0):
             raise ValueError(f"frustum_decay_factor must be in (0, 1]: {self.frustum_decay_factor}")
+        if not (0.0 < self.novote_soft_decay_factor <= 1.0):
+            raise ValueError(
+                f"novote_soft_decay_factor must be in (0, 1]: "
+                f"{self.novote_soft_decay_factor}"
+            )
 
         # Validate block_fill_ratio
         if not (0.0 < self.block_fill_ratio <= 1.0):

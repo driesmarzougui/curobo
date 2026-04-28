@@ -99,6 +99,7 @@ class Mapper:
             depth_maximum_distance=config.depth_maximum_distance,
             frustum_decay=config.frustum_decay_factor,
             time_decay=config.decay_factor,
+            novote_soft_decay=config.novote_soft_decay_factor,
             minimum_tsdf_weight=config.minimum_tsdf_weight,
             grid_shape=config.grid_shape,
             enable_static=config.enable_static,

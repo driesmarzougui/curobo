@@ -40,6 +40,17 @@ from curobo._src.util.warp import get_warp_device_stream
 # Threshold for considering a block empty (sum of weights across all voxels)
 BLOCK_EMPTY_THRESHOLD = wp.constant(0.01)
 
+# grocery_bot local patch #5 — separate sanity cap for the decay kernel's
+# free-space carving, independent of the integrator's `depth_maximum_distance`.
+# Integration uses a tight `[depth_min, depth_max]` window (e.g. 3 m for D415
+# surface-noise tolerance), but a valid depth reading past a voxel is
+# unambiguous evidence of free space regardless of how noisy it would be as
+# a surface.  Keeping this cap within the D415's working range (10 m) filters
+# pure-garbage readings while still admitting far-background "the obstacle is
+# gone" evidence.  Truly invalid pixels (0 / NaN / <min / ≥ sanity_max)
+# remain "no vote" — see patch #2.
+FREE_SPACE_SANITY_MAX_DEPTH_M = wp.constant(10.0)
+
 # =============================================================================
 # Block-Level Frustum Marking Kernel (Pass 1)
 # =============================================================================
@@ -487,7 +498,6 @@ def decay_voxels_exposure_aware_kernel(
     img_H: wp.int32,
     img_W: wp.int32,
     depth_min: wp.float32,
-    depth_max: wp.float32,
     # Grid
     origin: wp.array(dtype=wp.float32),
     voxel_size: wp.float32,
@@ -513,9 +523,25 @@ def decay_voxels_exposure_aware_kernel(
     # fraction of a truncation" (preserve) from "voxel where the obstacle
     # used to be, now clearly gone" (decay).
     free_space_margin: wp.float32,
+    # Soft decay applied to confirmed (w >= w_threshold) voxels stuck on
+    # persistent no-info — the dominant phantom-persistence mode when the
+    # ZED reads textureless surfaces (dark pegboard) as 0/NaN.  1.0 = no
+    # decay (current behaviour).  < 1.0 multiplies the voxel weight per
+    # tick; e.g. 0.95 drains a confirmed voxel from w=1.0 below
+    # minimum_tsdf_weight=0.1 in ~45 ticks (~4.5 s @ 10 Hz).  Real
+    # obstacles re-observed by integrate_voxels_kernel each tick refresh
+    # their weight via the (old + new) * frustum_decay path and never
+    # enter this branch — they are unaffected.
+    novote_soft_decay: wp.float32,
     max_blocks: wp.int32,
-    # Diagnostic counter: [0] = voxels decayed this call, [1] = voxels
-    # with old_w > 0 that were preserved.
+    # Diagnostic counters split by branch (4 entries) — let callers
+    # distinguish "real free-space carving" from "no-info preservation"
+    # which is the dominant phantom-persistence mode under low-confidence
+    # depth (textureless surfaces, ZED NEURAL stereo loss, etc.).
+    #   [0] decay_vote        — depth past voxel ⇒ decay (free-space evidence)
+    #   [1] preserve_vote     — depth near/before voxel ⇒ preserve (surface)
+    #   [2] no_vote_low_w     — no info but old_w < w_threshold ⇒ decay
+    #   [3] no_vote_high_w    — no info, old_w ≥ w_threshold ⇒ preserve
     diag_counts: wp.array(dtype=wp.int32),
 ):
     tid = wp.tid()
@@ -553,10 +579,14 @@ def decay_voxels_exposure_aware_kernel(
     #                      `integrate_voxels_kernel` either touched it or
     #                      it is occluded — preserve.
     #   exposed_no_info  — projection lands in bounds but depth is invalid
-    #                      (0 / NaN / <min_z / >max_z / self-masked).  No
-    #                      vote — neither evidence for nor against.  A
+    #                      (0 / NaN / <min_z / ≥ sanity_max / self-masked).
+    #                      No vote — neither evidence for nor against.  A
     #                      confirmed voxel survives; a low-weight phantom
     #                      still falls to the `old_w < w_threshold` clause.
+    #                      (Note: readings past the integrator's `depth_max`
+    #                      but within the wider sanity cap do *not* fall
+    #                      here — they count as free-space evidence; see
+    #                      tasks/curobo_vendor_patches.md #5.)
     #   not_exposed      — projection outside image bounds or too close
     #                      to the camera.  Preserve (out-of-frustum).
     # Final decision across cameras: PRESERVE if any camera says so, else
@@ -593,18 +623,26 @@ def decay_voxels_exposure_aware_kernel(
             if px >= 0 and px < img_W and py >= 0 and py < img_H:
                 exposed_any = wp.bool(True)
                 depth_val = depth_images[cam_i, py, px]
-                if depth_val >= depth_min and depth_val <= depth_max:
-                    # Valid depth.  Compare voxel z against surface.
+                if depth_val >= depth_min and depth_val < FREE_SPACE_SANITY_MAX_DEPTH_M:
+                    # Valid depth for free-space carving.  The gate is
+                    # deliberately wider than the integrator's
+                    # `[depth_min, depth_max]` window: integration treats
+                    # >max readings as too noisy to paint surfaces, but a
+                    # reading past a voxel is unambiguous "voxel is in free
+                    # space" evidence.  E.g. a 5 m reading past a phantom
+                    # voxel at z_cam=1.5 m should decay the phantom even
+                    # though depth_max=3.0 m.  grocery_bot local patch —
+                    # see tasks/curobo_vendor_patches.md #5.
                     if depth_val > z_cam + free_space_margin:
                         decay_vote = wp.bool(True)  # clear free space
                     else:
                         preserve_vote = wp.bool(True)  # near / behind surface
                 # else: depth invalid at the pixel (0 / NaN / <min_z /
-                # >max_z / self-masked).  No vote — treat as "no info".
-                # Confirmed voxels (old_w >= w_threshold) are preserved;
-                # low-weight phantoms still decay via the w_threshold
-                # clause below.  grocery_bot local patch — see
-                # tasks/curobo_vendor_patches.md #2.
+                # ≥ sanity_max / self-masked).  No vote — treat as "no
+                # info".  Confirmed voxels (old_w >= w_threshold) are
+                # preserved; low-weight phantoms still decay via the
+                # w_threshold clause below.  grocery_bot local patch —
+                # see tasks/curobo_vendor_patches.md #2.
 
     if preserve_vote:
         if exposed_any:
@@ -620,13 +658,32 @@ def decay_voxels_exposure_aware_kernel(
     # In case (1) we always decay (confirmed voxels too).
     # In case (2) we decay only below the confirmation threshold — i.e.
     # low-weight phantoms still get cleaned up, confirmed voxels survive.
-    if decay_vote or old_w < w_threshold:
+    if decay_vote:
         old_sw = wp.float32(block_data[block_idx, local_idx, 0])
         block_data[block_idx, local_idx, 0] = wp.float16(old_sw * frustum_decay)
         block_data[block_idx, local_idx, 1] = wp.float16(old_w * frustum_decay)
         wp.atomic_add(diag_counts, 0, wp.int32(1))
+    elif old_w < w_threshold:
+        old_sw = wp.float32(block_data[block_idx, local_idx, 0])
+        block_data[block_idx, local_idx, 0] = wp.float16(old_sw * frustum_decay)
+        block_data[block_idx, local_idx, 1] = wp.float16(old_w * frustum_decay)
+        wp.atomic_add(diag_counts, 2, wp.int32(1))
     else:
-        wp.atomic_add(diag_counts, 1, wp.int32(1))
+        # Confirmed voxel exposed but no info from any camera (depth was
+        # invalid at every projected pixel).  Default behaviour preserves
+        # unchanged; with novote_soft_decay < 1.0 we drain the weight
+        # gradually so confirmed phantoms in persistent textureless
+        # regions (e.g. ZED reading 0 on dark pegboard) eventually fall
+        # below minimum_tsdf_weight and disappear.
+        if novote_soft_decay < 1.0:
+            old_sw = wp.float32(block_data[block_idx, local_idx, 0])
+            block_data[block_idx, local_idx, 0] = wp.float16(
+                old_sw * novote_soft_decay,
+            )
+            block_data[block_idx, local_idx, 1] = wp.float16(
+                old_w * novote_soft_decay,
+            )
+        wp.atomic_add(diag_counts, 3, wp.int32(1))
 
 
 def decay_voxels_exposure_aware(
@@ -636,12 +693,12 @@ def decay_voxels_exposure_aware(
     cam_quaternions: torch.Tensor,
     depth_images: torch.Tensor,
     depth_min: float,
-    depth_max: float,
     frustum_decay: float,
     img_H: int,
     img_W: int,
     w_threshold: float = 0.6,
     free_space_margin: float = 0.15,
+    novote_soft_decay: float = 0.95,
 ):
     """Apply per-voxel exposure-gated decay to every allocated block.
 
@@ -662,6 +719,12 @@ def decay_voxels_exposure_aware(
         depth_min: Minimum valid depth [m] (shared across cameras).
         frustum_decay: Decay factor in (0, 1].  ``1.0`` = no-op.
         img_H, img_W: Image dimensions (shared across cameras).
+
+    Note: the decay kernel intentionally does **not** take ``depth_max``.
+    Free-space carving uses a wider sanity cap
+    (``FREE_SPACE_SANITY_MAX_DEPTH_M``, 10 m) than the integrator so
+    readings past ``depth_max`` still count as "voxel is in free space"
+    evidence.  See ``tasks/curobo_vendor_patches.md`` #5.
     """
     max_blocks = tsdf.config.max_blocks
     n_cameras = intrinsics.shape[0]
@@ -680,11 +743,13 @@ def decay_voxels_exposure_aware(
     else:
         grid_W_dim, grid_H_dim, grid_D = 0, 0, 0
 
-    # Diagnostic counter: [0] = voxels decayed this call, [1] = preserved.
-    # Stashed on the tsdf so callers (e.g. voxel_updater) can read it.
-    if not hasattr(tsdf, "_decay_diag_counts"):
+    # Diagnostic counters split by branch (4 entries):
+    #   [0] decay_vote, [1] preserve_vote,
+    #   [2] no_vote_low_w (decayed), [3] no_vote_high_w (preserved).
+    # Stashed on the tsdf so callers (e.g. voxel_updater) can read them.
+    if not hasattr(tsdf, "_decay_diag_counts") or tsdf._decay_diag_counts.numel() != 4:
         tsdf._decay_diag_counts = torch.zeros(
-            2, dtype=torch.int32, device=tsdf.data.block_data.device,
+            4, dtype=torch.int32, device=tsdf.data.block_data.device,
         )
     tsdf._decay_diag_counts.zero_()
 
@@ -700,7 +765,6 @@ def decay_voxels_exposure_aware(
             img_H,
             img_W,
             float(depth_min),
-            float(depth_max),
             wp.from_torch(tsdf.config.origin, dtype=wp.float32),
             tsdf.config.voxel_size,
             tsdf.config.block_size,
@@ -714,6 +778,7 @@ def decay_voxels_exposure_aware(
             wp.float32(frustum_decay),
             wp.float32(w_threshold),
             wp.float32(free_space_margin),
+            wp.float32(novote_soft_decay),
             max_blocks,
             wp.from_torch(tsdf._decay_diag_counts, dtype=wp.int32),
         ],
