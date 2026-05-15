@@ -167,6 +167,16 @@ class CSpaceParams:
         self.velocity_scale = self.velocity_scale[new_index].clone()
         self.acceleration_scale = self.acceleration_scale[new_index].clone()
         self.jerk_scale = self.jerk_scale[new_index].clone()
+        # Local patch (itf-2026 #11): also reindex ``position_limit_clip``
+        # when it's a per-joint tensor.  Upstream forgets this field, so a
+        # YAML with per-joint clip + ``lock_joints`` ends up with a 7-elem
+        # clip tensor while ``joint_limits["position"]`` reduces to 6,
+        # and ``_update_joint_limits``' broadcast-add raises a size
+        # mismatch (RuntimeError: tensor a (6) vs tensor b (7)).  Scalar
+        # clips broadcast cleanly so the bug only fires for the per-joint
+        # path.  See tasks/curobo_vendor_patches.md patch #11.
+        if isinstance(self.position_limit_clip, torch.Tensor):
+            self.position_limit_clip = self.position_limit_clip[new_index].clone()
         joint_names = [self.joint_names[n] for n in new_index]
         self.joint_names = joint_names
 
