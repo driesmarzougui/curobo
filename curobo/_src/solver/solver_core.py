@@ -455,6 +455,36 @@ class SolverCore:
             rollout.update_params_cost_managers(tool_pose_criteria=tool_pose_criteria)
         self.auxiliary_rollout.update_params_cost_managers(tool_pose_criteria=tool_pose_criteria)
 
+        # Local patch (grocery_bot #9 — companion to the SeedIKSolver edit):
+        # the rollout pose-cost criteria tensors just got mutated, but captured
+        # CUDA graphs that read those tensors (the optimizer's inner-loop graph
+        # and the per-rollout ``_compute_metrics_from_state_executor`` /
+        # ``_compute_metrics_from_action_executor``) still bake in the *prior*
+        # tensors' storage addresses. Replay reads stale memory →
+        # ``cudaErrorIllegalAddress`` / ``cudaErrorIllegalInstruction`` on the
+        # next plan call. ``reset_cuda_graph()`` drops the optimizer's captured
+        # graphs and every rollout's metrics executors, forcing fresh capture
+        # on the next call. Reset cost ≈100-500 ms, amortised over the
+        # surrounding plan. The reset is guarded internally on
+        # ``use_cuda_graph`` and ``_task_initialized``, so it's a no-op when
+        # graph capture isn't in use.
+        try:
+            self.reset_cuda_graph()
+        except Exception as e:  # noqa: BLE001
+            # Surface the failure rather than swallowing it — the captured
+            # graphs are now poisoned and the next plan call will most likely
+            # crash with cudaErrorIllegalAddress. Logging at warn lets the
+            # caller see WHY the next failure happens; we still don't re-raise
+            # because update_tool_pose_criteria itself returns void in
+            # upstream and we don't want to break the API contract from a
+            # vendor patch.
+            log_warn(
+                "grocery_bot patch #9: SolverCore.reset_cuda_graph() raised "
+                f"after update_tool_pose_criteria — captured graphs may now "
+                f"hold stale criteria references and the next plan call may "
+                f"hit cudaErrorIllegalAddress. Exception: {type(e).__name__}: {e}"
+            )
+
     # -----------------------------------------------------------------------
     # Sample configs (collision activation distance passed as arg)
     # -----------------------------------------------------------------------

@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING, Dict, Optional
 # CuRobo
 from curobo._src.cost.cost_cspace_cfg import CSpaceCostCfg
 from curobo._src.cost.cost_cspace_dist_cfg import CSpaceDistCostCfg
+# Local patch (grocery_bot #8): FOV occlusion cost — IK-only soft re-rank.
+from curobo._src.cost.cost_fov_occlusion_cfg import FOVOcclusionCostCfg
 from curobo._src.cost.cost_scene_collision_cfg import SceneCollisionCostCfg
 from curobo._src.cost.cost_self_collision_cfg import SelfCollisionCostCfg
 from curobo._src.cost.cost_tool_pose_cfg import ToolPoseCostCfg
@@ -62,6 +64,10 @@ class RobotCostManagerCfg:
     #: disables pose-based objectives.
     tool_pose_cfg: Optional[ToolPoseCostCfg] = None
 
+    #: Local patch (grocery_bot #8): IK-only FOV occlusion soft re-rank.
+    #: None or weight==0 disables.
+    fov_occlusion_cfg: Optional[FOVOcclusionCostCfg] = None
+
     def __post_init__(self):
         from .cost_manager_robot import RobotCostManager
 
@@ -85,6 +91,8 @@ class RobotCostManagerCfg:
             "start_cspace_dist_cfg": CSpaceDistCostCfg,
             "target_cspace_dist_cfg": CSpaceDistCostCfg,
             "tool_pose_cfg": ToolPoseCostCfg,
+            # Local patch (grocery_bot #8).
+            "fov_occlusion_cfg": FOVOcclusionCostCfg,
         }
         data = {}
         for k, cfg_class in cost_key_map.items():

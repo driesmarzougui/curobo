@@ -810,6 +810,21 @@ class SeedIKSolver:
 
     def update_tool_pose_criteria(self, tool_pose_criteria: Dict[str, ToolPoseCriteria]):
         self.error_calculator.update_tool_pose_criteria(tool_pose_criteria)
+        # Local patch (grocery_bot #9): invalidate captured CUDA graphs so they
+        # re-record against the freshly-mutated pose-cost criteria tensors.
+        # Without this, `_initial_state_executor` / `_inner_iterations_executor`
+        # were captured against the previous criteria and replay reads stale
+        # storage → cudaErrorIllegalAddress or cudaErrorIllegalInstruction on
+        # the next IK call (reproducer: `plan_grasp` installs `linear_motion`
+        # criteria for the grasp segment and resets to default afterward —
+        # both mutations corrupt the cache; the *following* plan_pose call
+        # is the one that crashes).
+        if self._initial_state_executor is not None:
+            self._initial_state_executor.reset()
+            self._initial_state_executor = None
+        if self._inner_iterations_executor is not None:
+            self._inner_iterations_executor.reset()
+            self._inner_iterations_executor = None
 
     def reset_seed(self):
         self.act_sample_gen.reset()

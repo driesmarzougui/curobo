@@ -10,7 +10,7 @@ collision checking.
 from __future__ import annotations
 
 # Standard Library
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 # Third Party
 import torch
@@ -461,6 +461,12 @@ class IKSolver:
         cost_list = []
         goalset_index_list = []
         pose_cost_list = []
+        # Local patches (grocery_bot #7, #8): separate accumulator for soft
+        # re-rank metrics — kept out of ``cost_list``'s ``torch.cat(..., dim=-1)``
+        # so we don't inflate the trailing axis used by the downstream
+        # ``cost_sum.view(-1, num_seeds)`` reshape. Both metrics flow through
+        # the same list and get folded together post-loop.
+        soft_rerank_aux_cost_list: List[torch.Tensor] = []
         for k in range(len(metrics_result.convergence.names)):
             metric_name = metrics_result.convergence.names[k]
             metric_values = metrics_result.convergence.values[k]
@@ -477,6 +483,11 @@ class IKSolver:
                 goalset_index_list.append(metric_values)
             elif "start_cspace_dist_tolerance" in metric_name:
                 cost_list.append(metric_values.view(-1, 1))
+            elif (
+                "cspace_target_tolerance" in metric_name      # patch #7
+                or "fov_occlusion_tolerance" in metric_name   # patch #8
+            ):
+                soft_rerank_aux_cost_list.append(metric_values.view(-1))
 
         converged_all_links = torch.cat(converge_list, dim=-1)
         converged = torch.all(converged_all_links, dim=-1).squeeze(-1)
@@ -502,6 +513,16 @@ class IKSolver:
         else:
             cost = pose_cost.sum(dim=-1).squeeze(-1)
         cost_sum = cost
+
+        # Local patches (grocery_bot #7, #8): fold soft re-rank metrics
+        # (cspace_target bias + FOV occlusion) into the topk ranking cost
+        # so seeds closer to the cspace target / clear of FOV win when
+        # pose-convergence is otherwise comparable. At baseline (both
+        # weights zero) the accumulated tensor is exactly zero and
+        # ranking is unchanged.
+        if soft_rerank_aux_cost_list:
+            soft_rerank_sum = torch.stack(soft_rerank_aux_cost_list, dim=0).sum(dim=0)
+            cost_sum = cost_sum + soft_rerank_sum.view(cost_sum.shape)
 
         cost_sum[~success] += 1e16
         cost_sum_reshaped = cost_sum.view(-1, num_seeds)

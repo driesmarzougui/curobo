@@ -507,6 +507,24 @@ class MotionPlanner:
         # Step 3: Linear motion from approach to grasp
         approach_end = get_joint_state_at_horizon_index(approach_result.js_solution, -1).squeeze(0)
         approach_end = self.kinematics.get_active_js(approach_end)
+        # Local patch (itf-2026, #10): strip the trajopt-tail derivatives so
+        # vendor seed_ik's velocity-clamped IK does NOT activate on this seed.
+        # ``get_joint_state_at_horizon_index`` returns a JointState whose
+        # ``dt=0.002`` + ``velocity`` are populated; that triggers
+        # seed_ik_solver._solve_impl's ``velocity_clamping_active=True``
+        # branch (seed_ik_solver.py:602-621), which tightens the per-joint
+        # IK bounds to ``q ± v_max·dt`` ≈ ±0.23° (seed_ik_error_calculator
+        # _compute_joint_limit_errors:355-360). The grasp pose sits at the
+        # standoff distance from approach-end (~12 cm Cartesian / several
+        # degrees per joint), which the tight bounds cannot reach — the IK
+        # then converges back onto the seed config and trajopt fits a flat
+        # zero-motion trajectory while still passing the convergence check
+        # weakly. Net live symptom: descent ran the robot 0 mm and the
+        # gripper closed on air at the standoff. See
+        # ``tasks/curobo_vendor_patches.md`` patch #10.
+        approach_end = JointState.from_position(
+            approach_end.position, joint_names=approach_end.joint_names,
+        )
 
         linear_motion = ToolPoseCriteria.linear_motion(
             axis=grasp_approach_axis, non_terminal_scale=1.0,

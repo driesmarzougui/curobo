@@ -16,6 +16,8 @@ import torch
 # CuRobo
 from curobo._src.cost.cost_base import BaseCost
 from curobo._src.cost.cost_cspace_dist import CSpaceDistCost
+# Local patch (grocery_bot #8): IK-only FOV occlusion soft re-rank.
+from curobo._src.cost.cost_fov_occlusion import FOVOcclusionCost
 from curobo._src.cost.cost_scene_collision import SceneCollisionCost
 from curobo._src.cost.cost_self_collision import SelfCollisionCost
 from curobo._src.cost.cost_tool_pose import ToolPoseCost
@@ -187,6 +189,15 @@ class RobotCostManager:
             config.target_cspace_dist_cfg.initialize_from_transition_model(transition_model)
             self.register_cost("target_cspace_dist", CSpaceDistCost(config.target_cspace_dist_cfg))
 
+        # Local patch (grocery_bot #8): FOV occlusion (IK-only soft re-rank).
+        # Registered with weight 0 baseline; caller mutates ``_weight`` at
+        # runtime to enable. Only contributes via ``compute_convergence`` →
+        # ``fov_occlusion_tolerance`` metric, so trajopt's mid-path waypoints
+        # are unaffected.
+        if config.fov_occlusion_cfg is not None:
+            config.fov_occlusion_cfg.initialize_from_transition_model(transition_model)
+            self.register_cost("fov_occlusion", FOVOcclusionCost(config.fov_occlusion_cfg))
+
         self._initialized = True
         log_info(f"Initialized {len(self.costs)} costs for robot rollout")
 
@@ -355,6 +366,44 @@ class RobotCostManager:
                 convergence.add(position_error, "tool_pose_position_tolerance")
                 convergence.add(rotation_error, "tool_pose_orientation_tolerance")
                 convergence.add(goalset_idx, "tool_pose_goalset_index")
+
+        # Local patch (grocery_bot #7): expose the cspace_target bias term as a
+        # convergence component so the IK's topk seed selection can rank by it.
+        # Companion patches: a cspace_cfg entry in metrics_base.yml's
+        # convergence_cfg (registers a weight-zero cspace cost so this
+        # ``has_cost`` check fires) and an elif branch in
+        # ``solver_ik.py::_get_result`` (consumes the new metric in the topk
+        # cost). The bias is gated by the runtime ``_cspace_target_weight``
+        # tensor: at baseline it's zero, so the emitted metric is exactly
+        # zero and topk behaviour is unchanged. When the caller enables the
+        # bias via in-place mutation, the metric carries the per-DOF squared
+        # deviation and topk picks seeds closer to the target. The compute is
+        # CUDA-graph-safe (no Python-side ``.item()`` / data-dependent
+        # branches) so it works under captured replays.
+        if self.has_cost("cspace"):
+            cspace_cost = self.get_cost("cspace")
+            scalar_w = getattr(cspace_cost, "_cspace_target_weight", None)
+            dof_w = getattr(cspace_cost.config, "cspace_target_dof_weight", None)
+            target_js = getattr(cspace_cost, "_target_joint_state", None)
+            if scalar_w is not None and dof_w is not None and target_js is not None:
+                pos = state.joint_state.position  # (batch, horizon, dof)
+                target = target_js.position.view(-1, pos.shape[-1])[0]
+                diff = pos - target.view(1, 1, -1)
+                val = (diff * diff * dof_w.view(1, 1, -1)).sum(dim=-1)
+                val = val * scalar_w.view(1, 1)
+                convergence.add(val, "cspace_target_tolerance")
+
+        # Local patch (grocery_bot #8): emit FOV occlusion as a convergence
+        # tolerance so the IK topk can re-rank seeds. At baseline the cost's
+        # ``_weight`` tensor is zero so ``forward`` produces zeros and ranking
+        # is unchanged; callers enable it by mutating ``_weight`` in place.
+        # The forward call must always run (no Python-side scalar comparison
+        # on ``_weight`` — that would force a ``.item()`` and break CUDA graph
+        # capture).
+        if self.has_cost("fov_occlusion"):
+            fov_cost = self.get_cost("fov_occlusion")
+            val = fov_cost.forward(state)  # (batch, horizon)
+            convergence.add(val, "fov_occlusion_tolerance")
 
         return convergence
 

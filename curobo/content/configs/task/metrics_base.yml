@@ -28,6 +28,30 @@ rollout:
       weight: 0.0
     start_cspace_dist_cfg:
       weight: 0.001
+    # Local patch (grocery_bot #7): register a cspace cost instance in the
+    # convergence manager with zero bound-weight (auto-disabled by BaseCost)
+    # so ``compute_convergence`` can read its ``_cspace_target_weight`` +
+    # ``cspace_target_dof_weight`` to emit a ``cspace_target_tolerance``
+    # metric when the caller has explicitly enabled the cspace_target bias
+    # via in-place mutation. Without this registration, the bias is felt as a
+    # per-seed LBFGS gradient only — the IK topk ranking ignores it.
+    cspace_cfg:
+      weight: [0.0, 0.0]
+      activation_distance: [0.0, 0.0]
+      cost_type: POSITION
+    # Local patch (grocery_bot #8): FOV occlusion soft re-rank. Registered
+    # here so the IK convergence manager owns the cost (trajopt's cost
+    # manager doesn't read this YAML section, hence "IK-only"). Baseline
+    # weight 0 → cost is dormant; caller flips ``_weight`` in place to
+    # enable. Defaults match a D415 wrist-mount on the CRX-10iAL.
+    fov_occlusion_cfg:
+      weight: [0.0]
+      camera_link: tcp
+      target_links: [link_2, link_3, link_4, link_5]
+      half_hfov_rad: 0.611   # ≈ 35° (D415 HFOV/2)
+      half_vfov_rad: 0.367   # ≈ 21° (D415 VFOV/2)
+      near_m: 0.05
+      far_m: 0.6
 
 
 scene_collision_checker_cfg:
