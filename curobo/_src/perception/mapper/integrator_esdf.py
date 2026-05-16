@@ -65,7 +65,7 @@ from curobo._src.perception.mapper.kernel.wp_esdf_seed import (
 from curobo._src.perception.mapper.storage import BlockSparseTSDF
 from curobo._src.types.camera import CameraObservation
 from curobo._src.util.cuda_graph_util import GraphExecutor
-from curobo._src.util.logging import log_info
+from curobo._src.util.logging import log_and_raise, log_info
 from curobo._src.util.torch_util import profile_class_methods
 
 
@@ -124,7 +124,22 @@ class BlockSparseESDFIntegratorCfg:
     # LOCAL PATCH (grocery_bot) #6: see BlockSparseTSDFIntegratorCfg for
     # full description.  Plumbed through to the inner TSDF integrator.
     novote_soft_decay: float = 0.95
+    # LOCAL PATCH (grocery_bot) #12: per-tick robot-occluder line-of-sight
+    # margin (m) for the exposure-aware decay sweep.  Plumbed through to
+    # the inner TSDF integrator.  See tasks/curobo_vendor_patches.md #12.
+    occluder_margin: float = 0.02
+    # LOCAL PATCH (grocery_bot) #3 knobs — see BlockSparseTSDFIntegratorCfg
+    # for the description.  Plumbed through to the inner TSDF integrator.
+    isolated_w_protect: float = 1.0
+    isolated_neighbor_threshold: int = 5
     minimum_tsdf_weight: float = 0.1
+    # LOCAL PATCH (grocery_bot) #13: ESDF-seeding-only weight gate (see
+    # MapperCfg.seed_tsdf_weight for full rationale).  Must be
+    # >= minimum_tsdf_weight; voxels in the gap exist in the TSDF but
+    # don't seed the ESDF, so the planner doesn't see them until they
+    # accumulate enough depth-observation weight.  When None, defaults
+    # to minimum_tsdf_weight in __post_init__ (no behaviour change).
+    seed_tsdf_weight: Optional[float] = None
     blend_esdf: bool = False
     use_cuda_graph: bool = True
     grid_shape: Optional[Tuple[int, int, int]] = None
@@ -150,6 +165,15 @@ class BlockSparseESDFIntegratorCfg:
             self.origin = torch.tensor(self.origin, dtype=torch.float32)
         if self.esdf_voxel_size is None:
             self.esdf_voxel_size = self.voxel_size
+        # Default seed_tsdf_weight = minimum_tsdf_weight when caller
+        # leaves it None — keeps upstream / pre-patch behaviour intact.
+        if self.seed_tsdf_weight is None:
+            self.seed_tsdf_weight = self.minimum_tsdf_weight
+        if self.seed_tsdf_weight < self.minimum_tsdf_weight:
+            raise ValueError(
+                f"seed_tsdf_weight ({self.seed_tsdf_weight}) must be >= "
+                f"minimum_tsdf_weight ({self.minimum_tsdf_weight})"
+            )
 
 
 @profile_class_methods
@@ -215,6 +239,9 @@ class BlockSparseESDFIntegrator:
             frustum_decay=config.frustum_decay,
             time_decay=config.time_decay,
             novote_soft_decay=config.novote_soft_decay,
+            occluder_margin=config.occluder_margin,
+            isolated_w_protect=config.isolated_w_protect,
+            isolated_neighbor_threshold=config.isolated_neighbor_threshold,
             minimum_tsdf_weight=config.minimum_tsdf_weight,
             grid_shape=config.grid_shape,
             image_height=config.image_height,
@@ -376,6 +403,7 @@ class BlockSparseESDFIntegrator:
     def integrate(
         self,
         observation: CameraObservation,
+        occluder_spheres: Optional[torch.Tensor] = None,
     ) -> None:
         """Integrate batched depth observation into block-sparse TSDF.
 
@@ -385,20 +413,38 @@ class BlockSparseESDFIntegrator:
 
         Args:
             observation: Batched camera observation.
+            occluder_spheres: Optional ``(n_spheres, 4)`` float32 tensor of
+                robot-occluder spheres in the grid's base frame
+                (grocery_bot local patch #12).  Passed straight through to
+                the inner TSDF integrator.  Only honoured when
+                ``integration_method='voxel_project'`` (the graph-bypassed
+                path); ignored under sort_filter graph capture.
         """
         if self._integrate_graph is not None:
+            if occluder_spheres is not None:
+                log_and_raise(
+                    "occluder_spheres requires integration_method='voxel_project'; "
+                    "the sort_filter graph-captured path cannot consume per-tick "
+                    "occluder data without a persistent in-place buffer."
+                )
             self._integrate_graph(observation)
         else:
-            self._integrate_impl(observation)
+            self._integrate_impl(observation, occluder_spheres=occluder_spheres)
 
         self._frame_count += 1
 
-    def _integrate_impl(self, observation: CameraObservation) -> None:
+    def _integrate_impl(
+        self,
+        observation: CameraObservation,
+        occluder_spheres: Optional[torch.Tensor] = None,
+    ) -> None:
         """Integration implementation for CUDA graph capture.
 
         Delegates to BlockSparseTSDFIntegrator for Sort & Filter integration.
         """
-        self._tsdf_integrator.integrate(observation)
+        self._tsdf_integrator.integrate(
+            observation, occluder_spheres=occluder_spheres,
+        )
 
     def compute_esdf(
         self,
@@ -460,6 +506,14 @@ class BlockSparseESDFIntegrator:
             propagation near surfaces, which is why gather can achieve
             higher recall despite being approximate.
         """
+        # LOCAL PATCH (grocery_bot) #13: gate ESDF surface seeding on
+        # ``seed_tsdf_weight`` instead of ``minimum_tsdf_weight``.  The
+        # gap [minimum, seed) is the "growing up" zone — voxels there
+        # are preserved in the TSDF (so they keep accumulating
+        # observations) but don't seed the ESDF, so the planner doesn't
+        # see them until they prove themselves.  Default
+        # ``seed_tsdf_weight == minimum_tsdf_weight`` recovers upstream
+        # behaviour exactly.
         if self.config.seeding_method == "scatter":
             seed_esdf_sites_from_block_sparse_warp(
                 self._tsdf_integrator.tsdf,
@@ -467,7 +521,7 @@ class BlockSparseESDFIntegrator:
                 esdf_origin,
                 esdf_voxel_size,
                 self._esdf_grid_shape,
-                minimum_tsdf_weight=self.config.minimum_tsdf_weight,
+                minimum_tsdf_weight=self.config.seed_tsdf_weight,
                 truncation_distance=self.config.truncation_distance,
                 grid_shape=self.config.grid_shape,
             )
@@ -479,7 +533,7 @@ class BlockSparseESDFIntegrator:
                 esdf_origin,
                 esdf_voxel_size,
                 self._esdf_grid_shape,
-                minimum_tsdf_weight=self.config.minimum_tsdf_weight,
+                minimum_tsdf_weight=self.config.seed_tsdf_weight,
                 truncation_distance=self.config.truncation_distance,
                 grid_shape=self.config.grid_shape,
             )
@@ -496,6 +550,10 @@ class BlockSparseESDFIntegrator:
         """
         self._edt.propagate(self._site_index)
 
+        # LOCAL PATCH (grocery_bot) #13: same gate as seeding — voxels
+        # in the [minimum, seed) growing-up band are treated as empty
+        # for distance computation, so they don't contribute to the
+        # planner's ESDF surface.
         compute_esdf_from_min_tsdf_warp(
             self._site_index,
             self._tsdf_integrator.tsdf,
@@ -504,7 +562,7 @@ class BlockSparseESDFIntegrator:
             self._dist_field,
             esdf_origin,
             adjacent_skip_steps=self.config.adjacent_skip_steps,
-            minimum_tsdf_weight=self.config.minimum_tsdf_weight,
+            minimum_tsdf_weight=self.config.seed_tsdf_weight,
             grid_shape=self.config.grid_shape,
         )
 

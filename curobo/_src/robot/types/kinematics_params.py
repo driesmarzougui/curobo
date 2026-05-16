@@ -761,22 +761,44 @@ class KinematicsParams:
 
         # Helper functions
         def _joint_type_to_urdf_type(joint_type_value: int):
-            """Convert CuRobo JointType to URDF joint type and axis."""
+            """Convert CuRobo JointType to URDF joint type and axis.
+
+            ITF-2026 patch: the upstream implementation collapsed every
+            ``*_NEG`` joint type to a positive axis (e.g. ``X_ROT_NEG`` →
+            ``[1, 0, 0]``). That dropped the joint's sign so any robot
+            with negative-axis joints (FANUC CRX-10iA/L joints 3–6 here)
+            rendered with rotations going the wrong way when
+            :class:`ViserVisualizer` re-derived the URDF from
+            :meth:`export_to_urdf` (triggered by ``extra_links``).
+            See tasks/curobo_vendor_patches.md.
+            """
             joint_type = JointType(joint_type_value)
             if joint_type == JointType.FIXED:
                 return "fixed", None  # np.array([0.0, 0.0, 1.0])
-            elif joint_type == JointType.X_PRISM or joint_type == JointType.X_PRISM_NEG:
+            elif joint_type == JointType.X_PRISM:
                 return "prismatic", np.array([1.0, 0.0, 0.0])
-            elif joint_type == JointType.Y_PRISM or joint_type == JointType.Y_PRISM_NEG:
+            elif joint_type == JointType.X_PRISM_NEG:
+                return "prismatic", np.array([-1.0, 0.0, 0.0])
+            elif joint_type == JointType.Y_PRISM:
                 return "prismatic", np.array([0.0, 1.0, 0.0])
-            elif joint_type == JointType.Z_PRISM or joint_type == JointType.Z_PRISM_NEG:
+            elif joint_type == JointType.Y_PRISM_NEG:
+                return "prismatic", np.array([0.0, -1.0, 0.0])
+            elif joint_type == JointType.Z_PRISM:
                 return "prismatic", np.array([0.0, 0.0, 1.0])
-            elif joint_type == JointType.X_ROT or joint_type == JointType.X_ROT_NEG:
+            elif joint_type == JointType.Z_PRISM_NEG:
+                return "prismatic", np.array([0.0, 0.0, -1.0])
+            elif joint_type == JointType.X_ROT:
                 return "revolute", np.array([1.0, 0.0, 0.0])
-            elif joint_type == JointType.Y_ROT or joint_type == JointType.Y_ROT_NEG:
+            elif joint_type == JointType.X_ROT_NEG:
+                return "revolute", np.array([-1.0, 0.0, 0.0])
+            elif joint_type == JointType.Y_ROT:
                 return "revolute", np.array([0.0, 1.0, 0.0])
-            elif joint_type == JointType.Z_ROT or joint_type == JointType.Z_ROT_NEG:
+            elif joint_type == JointType.Y_ROT_NEG:
+                return "revolute", np.array([0.0, -1.0, 0.0])
+            elif joint_type == JointType.Z_ROT:
                 return "revolute", np.array([0.0, 0.0, 1.0])
+            elif joint_type == JointType.Z_ROT_NEG:
+                return "revolute", np.array([0.0, 0.0, -1.0])
             else:
                 return "fixed", None  # np.array([0.0, 0.0, 1.0])
 
@@ -885,6 +907,24 @@ class KinematicsParams:
 
             # Convert to URDF joint type and axis
             urdf_joint_type, axis = _joint_type_to_urdf_type(joint_type_value)
+
+            # ITF-2026 patch: ``joint_map_type`` stores only the canonical
+            # positive joint type; the sign of negative-axis joints
+            # (FANUC CRX-10iA/L joints 3-6 here) is stashed in
+            # ``joint_offset_map[2 * link_idx]`` as a scale of -1.0.
+            # Without this, the exported URDF flips those joints'
+            # rotation direction, which silently mis-renders the arm in
+            # :class:`ViserVisualizer` whenever ``extra_links`` triggers
+            # the export-to-temp-URDF path. See
+            # tasks/curobo_vendor_patches.md.
+            if axis is not None and self.joint_offset_map is not None:
+                offset_idx = 2 * link_idx
+                if offset_idx < self.joint_offset_map.shape[0]:
+                    joint_scale = float(
+                        self.joint_offset_map[offset_idx].cpu().numpy()
+                    )
+                    if joint_scale < 0.0:
+                        axis = -axis
 
             # Get fixed transform (origin)
             fixed_transform = self.fixed_transforms[link_idx].cpu().numpy()

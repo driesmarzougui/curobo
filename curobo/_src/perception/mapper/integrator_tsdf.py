@@ -112,6 +112,31 @@ class BlockSparseTSDFIntegratorCfg:
     # every tick are unaffected (they never enter the no-info branch).
     # See tasks/curobo_vendor_patches.md #6.
     novote_soft_decay: float = 0.95
+    # LOCAL PATCH (grocery_bot) #12: extra margin (m) added to every
+    # robot-occluder sphere radius before the line-of-sight test inside
+    # ``decay_voxels_exposure_aware``.  Covers joint-state lag + sphere-
+    # model imperfection.  See tasks/curobo_vendor_patches.md #12.
+    occluder_margin: float = 0.02
+    # LOCAL PATCH (grocery_bot) #3 knobs (was hardcoded at the call site):
+    #   isolated_w_protect: voxels with w > this are skipped by the
+    #     isolated-voxel sweep.  Was 0.95 ("preserve confirmed"); now 1.0
+    #     by default (effectively disabled).  The original guard was
+    #     over-defensive — real surfaces in the TSDF truncation band have
+    #     15+ occupied neighbours, so the neighbor-count gate alone
+    #     protects them.  Disabling lets confirmed-orphan-isolated
+    #     phantoms drain (the case where a voxel got integrated past
+    #     ``w_protect`` early, then fell out of every camera's frustum
+    #     and got occluded by the robot from every other camera — patch
+    #     #2's exposure-aware sweep has no exposed_any flag to fire, and
+    #     the old w_protect guard short-circuited the isolated sweep
+    #     too, so these voxels persisted forever).
+    #   isolated_neighbor_threshold: voxels with ≤ this many occupied
+    #     26-neighbours are decayed.  Was 2 (just 1-voxel-wide lines);
+    #     now 5 (catches small isolated clusters up to ~6 voxels) — at
+    #     2 cm TSDF voxels + 0.06 m truncation, every real surface voxel
+    #     has 15+ neighbours so 5 stays well under the safe margin.
+    isolated_w_protect: float = 1.0
+    isolated_neighbor_threshold: int = 5
     minimum_tsdf_weight: float = 0.1
     grid_shape: Optional[Tuple[int, int, int]] = None  # Optional bounds checking
     roughness: float = 3.0  # Geometric complexity multiplier
@@ -236,6 +261,7 @@ class BlockSparseTSDFIntegrator:
     def integrate(
         self,
         observation: CameraObservation,
+        occluder_spheres: Optional[torch.Tensor] = None,
     ):
         """Integrate a batched camera observation into the TSDF.
 
@@ -249,6 +275,14 @@ class BlockSparseTSDFIntegrator:
 
         Args:
             observation: Batched camera observation.
+            occluder_spheres: Optional ``(n_spheres, 4)`` float32 tensor of
+                ``(x, y, z, r)`` rows in the grid's base frame
+                (grocery_bot local patch #12).  When supplied, each
+                (camera, voxel) line-of-sight is tested for robot occlusion
+                in ``decay_voxels_exposure_aware`` — voxels behind the robot
+                from a given camera contribute no vote from that camera,
+                so ZED-confirmed voxels survive arm sweeps.  Passing
+                ``None`` keeps the upstream (decay-everywhere) behaviour.
 
         Raises:
             ValueError: If the leading dimension does not match ``num_cameras``.
@@ -321,23 +355,28 @@ class BlockSparseTSDFIntegrator:
                     img_H=img_shape[0],
                     img_W=img_shape[1],
                     novote_soft_decay=self.config.novote_soft_decay,
+                    occluder_spheres=occluder_spheres,
+                    occluder_margin=self.config.occluder_margin,
                 )
                 # LOCAL PATCH (grocery_bot) #3: isolated-voxel sweep.
-                # Orphan phantoms that sit in permanently-occluded regions
-                # (behind the arm / gripper) are preserved by the exposure-
-                # aware sweep above because their projected pixels always
-                # read invalid depth (self-mask) — they never get a chance
-                # to fall to branch (a) free-space carving.  This pass
-                # carves them via geometric connectivity instead: a voxel
-                # with ≤ 2 occupied 26-neighbours is almost certainly
-                # noise at our voxel scale.  Confirmed voxels (w > 0.95)
-                # are skipped unconditionally.
+                # Orphan phantoms in unobserved regions (out of every
+                # camera's frustum AND occluded by the robot from every
+                # other camera — see patch #12) are preserved by the
+                # exposure-aware sweep above because no camera contributes
+                # a vote (``exposed_any`` stays False).  This pass carves
+                # them via geometric connectivity: a voxel with
+                # ≤ ``isolated_neighbor_threshold`` occupied 26-neighbours
+                # is almost certainly noise at our voxel scale.  Knobs
+                # are read from the integrator cfg — see the field
+                # docstrings + tasks/curobo_vendor_patches.md #3 for
+                # the rationale on the new defaults (w_protect 0.95→1.0,
+                # neighbor_threshold 2→5).
                 decay_isolated_voxels(
                     self._tsdf,
                     frustum_decay=self.config.frustum_decay,
-                    w_protect=0.95,
+                    w_protect=self.config.isolated_w_protect,
                     w_occupied=self.config.minimum_tsdf_weight,
-                    neighbor_threshold=2,
+                    neighbor_threshold=self.config.isolated_neighbor_threshold,
                 )
             if self.config.time_decay < 1.0:
                 # Fast path: global time-decay + sums refresh + recycle.

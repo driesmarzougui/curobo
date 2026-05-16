@@ -533,6 +533,20 @@ def decay_voxels_exposure_aware_kernel(
     # their weight via the (old + new) * frustum_decay path and never
     # enter this branch — they are unaffected.
     novote_soft_decay: wp.float32,
+    # grocery_bot local patch #12: per-tick robot-occluder spheres.  Each
+    # (cam, voxel) pair tests whether the line segment from camera origin
+    # to voxel center passes within (r + occluder_margin) of any sphere;
+    # if it does, that camera contributes NO vote (no preserve / no decay
+    # / no no-vote) — same effect as the voxel being out of that camera's
+    # frustum.  Lets a ZED-observed voxel survive when the robot body
+    # occludes the line of sight, instead of draining via frustum_decay /
+    # novote_soft_decay every time the arm sweeps in front of the camera.
+    # Layout: ``(n_occluder_spheres, 4)`` rows of ``(x, y, z, r)`` in the
+    # base frame the grid lives in.  Pass ``n_occluder_spheres = 0`` to
+    # disable the test (the kernel skips the inner loop entirely).
+    occluder_spheres: wp.array2d(dtype=wp.float32),
+    n_occluder_spheres: wp.int32,
+    occluder_margin: wp.float32,
     max_blocks: wp.int32,
     # Diagnostic counters split by branch (4 entries) — let callers
     # distinguish "real free-space carving" from "no-info preservation"
@@ -621,6 +635,56 @@ def decay_voxels_exposure_aware_kernel(
             px = wp.int32(u)
             py = wp.int32(v)
             if px >= 0 and px < img_W and py >= 0 and py < img_H:
+                # grocery_bot local patch #12: skip this camera's vote when
+                # the line of sight from cam_pos to voxel_center passes
+                # through any robot-occluder sphere — the camera literally
+                # cannot see this voxel, so its depth reading at (px, py)
+                # is about the robot, not about the voxel.  Without this,
+                # ZED-confirmed voxels behind the robot body decay every
+                # time the arm sweeps through the line of sight (frustum
+                # decay every tick, then novote-soft-decay after the
+                # confirmed-weight threshold), and parts of the scene
+                # disappear during planning.  Cleared as "out of this
+                # camera's frustum" (no exposed_any flag, no decay/preserve
+                # vote) so the multi-camera aggregation falls back to
+                # whichever camera still has unobstructed line of sight.
+                occluded_by_robot = wp.bool(False)
+                if n_occluder_spheres > 0:
+                    seg = voxel_center - cam_pos
+                    seg_len_sq = wp.dot(seg, seg)
+                    if seg_len_sq > 1.0e-8:
+                        s_i = wp.int32(0)
+                        while s_i < n_occluder_spheres and not occluded_by_robot:
+                            sphere_center = wp.vec3(
+                                occluder_spheres[s_i, 0],
+                                occluder_spheres[s_i, 1],
+                                occluder_spheres[s_i, 2],
+                            )
+                            sphere_radius = occluder_spheres[s_i, 3]
+                            r_eff = sphere_radius + occluder_margin
+                            r_eff_sq = r_eff * r_eff
+                            to_sphere = sphere_center - cam_pos
+                            cam_inside_sphere = (
+                                wp.dot(to_sphere, to_sphere) < r_eff_sq
+                            )
+                            # Skip spheres that contain the camera origin
+                            # (e.g. the gripper-mounted D415 sits inside
+                            # gripper spheres); they would mask every voxel
+                            # for that camera.  The camera's FOV looks past
+                            # its mount.
+                            if not cam_inside_sphere:
+                                t = wp.dot(to_sphere, seg) / seg_len_sq
+                                if t > 0.0 and t < 1.0:
+                                    closest = cam_pos + seg * t
+                                    diff = sphere_center - closest
+                                    dist_sq = wp.dot(diff, diff)
+                                    if dist_sq < r_eff_sq:
+                                        occluded_by_robot = wp.bool(True)
+                            s_i = s_i + 1
+                if occluded_by_robot:
+                    # Treat exactly like "outside this camera's frustum":
+                    # no vote of any kind from this camera for this voxel.
+                    continue
                 exposed_any = wp.bool(True)
                 depth_val = depth_images[cam_i, py, px]
                 if depth_val >= depth_min and depth_val < FREE_SPACE_SANITY_MAX_DEPTH_M:
@@ -699,6 +763,8 @@ def decay_voxels_exposure_aware(
     w_threshold: float = 0.6,
     free_space_margin: float = 0.15,
     novote_soft_decay: float = 0.95,
+    occluder_spheres: torch.Tensor | None = None,
+    occluder_margin: float = 0.02,
 ):
     """Apply per-voxel exposure-gated decay to every allocated block.
 
@@ -725,6 +791,15 @@ def decay_voxels_exposure_aware(
     (``FREE_SPACE_SANITY_MAX_DEPTH_M``, 10 m) than the integrator so
     readings past ``depth_max`` still count as "voxel is in free space"
     evidence.  See ``tasks/curobo_vendor_patches.md`` #5.
+
+    ``occluder_spheres`` (grocery_bot local patch #12) is an optional
+    ``(n_spheres, 4)`` float32 tensor of ``(x, y, z, r)`` rows in the
+    grid's base frame.  When supplied, each (camera, voxel) line of sight
+    is tested against every sphere; voxels whose line of sight is broken
+    by any sphere contribute NO vote from that camera (mirrors out-of-
+    frustum behaviour).  ``occluder_margin`` adds a small fudge factor to
+    the sphere radius to cover joint-state lag.  Passing ``None`` disables
+    the test — the inner sphere loop has ``n_occluder_spheres = 0``.
     """
     max_blocks = tsdf.config.max_blocks
     n_cameras = intrinsics.shape[0]
@@ -733,6 +808,30 @@ def decay_voxels_exposure_aware(
         intrinsics=intrinsics,
         cam_positions=cam_positions,
         cam_quaternions=cam_quaternions,
+    )
+
+    # Occluder spheres are optional — when disabled we still need a real
+    # 2-D tensor for the kernel signature (warp won't accept None).  A
+    # 1-row dummy + n_occluder_spheres=0 makes the inner loop a no-op.
+    if occluder_spheres is None or occluder_spheres.numel() == 0:
+        occluder_spheres_t = torch.zeros(
+            (1, 4), dtype=torch.float32, device=tsdf.data.block_data.device,
+        )
+        n_occluder_spheres = 0
+    else:
+        occluder_spheres_t = occluder_spheres
+        if occluder_spheres_t.dtype != torch.float32:
+            occluder_spheres_t = occluder_spheres_t.to(dtype=torch.float32)
+        if not occluder_spheres_t.is_contiguous():
+            occluder_spheres_t = occluder_spheres_t.contiguous()
+        if occluder_spheres_t.dim() != 2 or occluder_spheres_t.shape[-1] != 4:
+            raise ValueError(
+                "occluder_spheres must be (n, 4) float32; got "
+                f"shape={tuple(occluder_spheres_t.shape)}"
+            )
+        n_occluder_spheres = int(occluder_spheres_t.shape[0])
+    check_float32_tensors(
+        intrinsics.device, occluder_spheres=occluder_spheres_t,
     )
 
     data = tsdf.get_warp_data()
@@ -779,6 +878,9 @@ def decay_voxels_exposure_aware(
             wp.float32(w_threshold),
             wp.float32(free_space_margin),
             wp.float32(novote_soft_decay),
+            wp.from_torch(occluder_spheres_t, dtype=wp.float32),
+            wp.int32(n_occluder_spheres),
+            wp.float32(occluder_margin),
             max_blocks,
             wp.from_torch(tsdf._decay_diag_counts, dtype=wp.int32),
         ],

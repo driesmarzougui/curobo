@@ -100,7 +100,11 @@ class Mapper:
             frustum_decay=config.frustum_decay_factor,
             time_decay=config.decay_factor,
             novote_soft_decay=config.novote_soft_decay_factor,
+            occluder_margin=config.occluder_margin,
+            isolated_w_protect=config.isolated_w_protect_factor,
+            isolated_neighbor_threshold=config.isolated_neighbor_threshold,
             minimum_tsdf_weight=config.minimum_tsdf_weight,
+            seed_tsdf_weight=config.seed_tsdf_weight,
             grid_shape=config.grid_shape,
             enable_static=config.enable_static,
             static_obstacle_color=config.static_obstacle_color,
@@ -127,6 +131,7 @@ class Mapper:
     def integrate(
         self,
         observation: CameraObservation,
+        occluder_spheres: Optional[torch.Tensor] = None,
     ) -> None:
         """Integrate batched depth observation into TSDF.
 
@@ -136,8 +141,18 @@ class Mapper:
 
         Args:
             observation: Batched camera observation.
+            occluder_spheres: Optional ``(n_spheres, 4)`` float32 tensor of
+                robot-occluder spheres ``(x, y, z, r)`` in the grid's base
+                frame (grocery_bot local patch #12).  When supplied, the
+                exposure-aware decay sweep skips per-camera votes for any
+                voxel whose line of sight to that camera is broken by a
+                sphere — used to preserve ZED-confirmed voxels when the
+                robot arm sweeps in front of the camera.  ``None`` falls
+                back to upstream decay behaviour.
         """
-        self._integrator.integrate(observation)
+        self._integrator.integrate(
+            observation, occluder_spheres=occluder_spheres,
+        )
 
     def compute_esdf(
         self,

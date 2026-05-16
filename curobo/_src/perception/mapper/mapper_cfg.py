@@ -71,6 +71,18 @@ class MapperCfg:
     # === TSDF ===
     truncation_distance: float = 0.04
     minimum_tsdf_weight: float = 0.1
+    # LOCAL PATCH (grocery_bot) #13: separate threshold for ESDF
+    # surface seeding (planner visibility) from the TSDF-existence
+    # threshold above.  When ``> minimum_tsdf_weight``, voxels in the
+    # gap ``[minimum_tsdf_weight, seed_tsdf_weight)`` exist in the
+    # TSDF (won't be aggressively decayed as noise, will appear in the
+    # mesh / overlay) but are NOT seen by the planner.  Default
+    # ``None`` ≡ ``minimum_tsdf_weight`` (no behaviour change).  Raise
+    # to require more depth-observation evidence before noise becomes
+    # planner-blocking — at the cost of ~1-2 extra integrate ticks of
+    # latency before real obstacles enter the planner's collision set.
+    # See tasks/curobo_vendor_patches.md #13.
+    seed_tsdf_weight: Optional[float] = None
 
     # === Depth Sensor ===
     depth_minimum_distance: float = 0.1
@@ -86,6 +98,24 @@ class MapperCfg:
     # #2 behaviour).  Real obstacles re-observed every tick are
     # unaffected.  See tasks/curobo_vendor_patches.md #6.
     novote_soft_decay_factor: float = 0.95
+    # LOCAL PATCH (grocery_bot) #12: line-of-sight margin (m) added to each
+    # robot-occluder sphere radius before the per-(camera, voxel)
+    # occlusion test in ``decay_voxels_exposure_aware``.  Covers joint-
+    # state lag + sphere-model imperfection.  Plumbed into both inner
+    # integrators when the caller supplies ``occluder_spheres`` to
+    # ``Mapper.integrate``.  See tasks/curobo_vendor_patches.md #12.
+    occluder_margin: float = 0.02
+    # LOCAL PATCH (grocery_bot) #3 knobs:
+    #   isolated_w_protect_factor: voxels with w > this are skipped by
+    #     the isolated-voxel sweep.  Default 1.0 = disabled (the
+    #     neighbor-count gate alone protects real surfaces).
+    #   isolated_neighbor_threshold: voxels with ≤ this many occupied
+    #     26-neighbours are decayed by ``frustum_decay_factor``.
+    #     Default 5 — real surfaces in the TSDF truncation band have
+    #     15+ neighbours, so 5 stays well under the safe margin while
+    #     catching small isolated clusters.
+    isolated_w_protect_factor: float = 1.0
+    isolated_neighbor_threshold: int = 5
 
     # === RGB ===
     rgb_scale: int = 1
@@ -159,6 +189,30 @@ class MapperCfg:
             raise ValueError(
                 f"novote_soft_decay_factor must be in (0, 1]: "
                 f"{self.novote_soft_decay_factor}"
+            )
+        if self.occluder_margin < 0.0:
+            raise ValueError(
+                f"occluder_margin must be >= 0: {self.occluder_margin}"
+            )
+        if not (0.0 < self.isolated_w_protect_factor <= 1.0):
+            raise ValueError(
+                f"isolated_w_protect_factor must be in (0, 1]: "
+                f"{self.isolated_w_protect_factor}"
+            )
+        if self.isolated_neighbor_threshold < 0:
+            raise ValueError(
+                f"isolated_neighbor_threshold must be >= 0: "
+                f"{self.isolated_neighbor_threshold}"
+            )
+        # Resolve seed_tsdf_weight default + validate.  Default falls
+        # back to minimum_tsdf_weight (preserves upstream behaviour);
+        # anything explicit must lie in [minimum_tsdf_weight, 1.0].
+        if self.seed_tsdf_weight is None:
+            self.seed_tsdf_weight = self.minimum_tsdf_weight
+        if self.seed_tsdf_weight < self.minimum_tsdf_weight:
+            raise ValueError(
+                f"seed_tsdf_weight ({self.seed_tsdf_weight}) must be >= "
+                f"minimum_tsdf_weight ({self.minimum_tsdf_weight})"
             )
 
         # Validate block_fill_ratio
