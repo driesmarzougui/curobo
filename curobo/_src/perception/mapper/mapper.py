@@ -103,6 +103,7 @@ class Mapper:
             occluder_margin=config.occluder_margin,
             isolated_w_protect=config.isolated_w_protect_factor,
             isolated_neighbor_threshold=config.isolated_neighbor_threshold,
+            isolated_decay_factor=config.isolated_decay_factor,
             minimum_tsdf_weight=config.minimum_tsdf_weight,
             seed_tsdf_weight=config.seed_tsdf_weight,
             grid_shape=config.grid_shape,

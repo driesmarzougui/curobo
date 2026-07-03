@@ -110,12 +110,22 @@ class MapperCfg:
     #     the isolated-voxel sweep.  Default 1.0 = disabled (the
     #     neighbor-count gate alone protects real surfaces).
     #   isolated_neighbor_threshold: voxels with ≤ this many occupied
-    #     26-neighbours are decayed by ``frustum_decay_factor``.
+    #     26-neighbours are decayed by ``isolated_decay_factor``.
     #     Default 5 — real surfaces in the TSDF truncation band have
     #     15+ neighbours, so 5 stays well under the safe margin while
     #     catching small isolated clusters.
+    #   isolated_decay_factor: multiplier applied to voxels caught by
+    #     the neighbor-count gate.  Was hardcoded to
+    #     ``frustum_decay_factor`` (0.5).  A persistently re-observed
+    #     singleton then stabilises at
+    #     ``w_ss = (f_int * f_iso) / (1 - f_int * f_iso) = 0.333`` at
+    #     ``f = 0.5``, just above ``minimum_tsdf_weight = 0.3``.
+    #     Splitting the factor (default 0.3) drives that ss to ≈ 0.176
+    #     so persistent noise singletons fall below the visibility
+    #     floor.  Real surfaces are unaffected (neighbor-count gate).
     isolated_w_protect_factor: float = 1.0
     isolated_neighbor_threshold: int = 5
+    isolated_decay_factor: float = 0.3
 
     # === RGB ===
     rgb_scale: int = 1
@@ -203,6 +213,11 @@ class MapperCfg:
             raise ValueError(
                 f"isolated_neighbor_threshold must be >= 0: "
                 f"{self.isolated_neighbor_threshold}"
+            )
+        if not (0.0 < self.isolated_decay_factor <= 1.0):
+            raise ValueError(
+                f"isolated_decay_factor must be in (0, 1]: "
+                f"{self.isolated_decay_factor}"
             )
         # Resolve seed_tsdf_weight default + validate.  Default falls
         # back to minimum_tsdf_weight (preserves upstream behaviour);

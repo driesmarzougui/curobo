@@ -956,8 +956,16 @@ def decay_isolated_voxels_kernel(
         return
 
     old_w = wp.float32(block_data[block_idx, local_idx, 1])
-    if old_w <= w_occupied:
-        return  # empty / effectively empty
+    # Strict ``<`` so this gate agrees with ``sample_voxel``'s ``w >=
+    # minimum_tsdf_weight`` visibility predicate.  With ``<=`` a voxel
+    # at exactly ``w_occupied`` was treated as "empty" here and skipped,
+    # while ``sample_voxel`` still rendered it — so an out-of-view
+    # confirmed singleton decays from w=1.0 → w_occupied (one isolated
+    # tick at factor 0.3 with w_occupied=0.3) and then sticks there
+    # forever, visible in the planner / viser.  With ``<`` it gets
+    # decayed once more (w → 0.09) and drops below the visibility floor.
+    if old_w < w_occupied:
+        return  # empty / effectively empty (matches sample_voxel)
     if old_w > w_protect:
         return  # confirmed — safety belt 1
 

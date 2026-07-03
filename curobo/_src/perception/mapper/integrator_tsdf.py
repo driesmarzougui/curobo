@@ -135,8 +135,19 @@ class BlockSparseTSDFIntegratorCfg:
     #     now 5 (catches small isolated clusters up to ~6 voxels) — at
     #     2 cm TSDF voxels + 0.06 m truncation, every real surface voxel
     #     has 15+ neighbours so 5 stays well under the safe margin.
+    #   isolated_decay_factor: multiplier applied to voxels that fall
+    #     under the neighbor-count gate.  Used to be hardcoded to
+    #     ``frustum_decay`` (0.5), but a persistently-observed singleton
+    #     then stabilises at ``w_ss = (f_int * f_iso) / (1 - f_int * f_iso)``
+    #     = 0.333 with both factors at 0.5 — just above the visibility
+    #     floor (``minimum_tsdf_weight = 0.3``).  Splitting the factor
+    #     lets the isolated sweep drive the singleton steady state below
+    #     ``minimum_tsdf_weight``: at 0.3 the ss falls to 0.176.  Real
+    #     surfaces are unaffected — they're guarded by the neighbor-count
+    #     gate (15+ neighbours in the truncation band).
     isolated_w_protect: float = 1.0
     isolated_neighbor_threshold: int = 5
+    isolated_decay_factor: float = 0.3
     minimum_tsdf_weight: float = 0.1
     grid_shape: Optional[Tuple[int, int, int]] = None  # Optional bounds checking
     roughness: float = 3.0  # Geometric complexity multiplier
@@ -373,7 +384,15 @@ class BlockSparseTSDFIntegrator:
                 # neighbor_threshold 2→5).
                 decay_isolated_voxels(
                     self._tsdf,
-                    frustum_decay=self.config.frustum_decay,
+                    # Use a dedicated factor (default 0.3) rather than
+                    # ``frustum_decay`` (0.5).  Both multipliers compound
+                    # per-tick on observed singletons, so a single shared
+                    # 0.5 leaves the steady state at w ≈ 0.333 — just
+                    # above ``minimum_tsdf_weight = 0.3``.  Splitting
+                    # the factor pushes the singleton ss to ≈ 0.176,
+                    # below the visibility floor.  See cfg field
+                    # docstring + tasks/curobo_vendor_patches.md #3.
+                    frustum_decay=self.config.isolated_decay_factor,
                     w_protect=self.config.isolated_w_protect,
                     w_occupied=self.config.minimum_tsdf_weight,
                     neighbor_threshold=self.config.isolated_neighbor_threshold,

@@ -132,6 +132,7 @@ class BlockSparseESDFIntegratorCfg:
     # for the description.  Plumbed through to the inner TSDF integrator.
     isolated_w_protect: float = 1.0
     isolated_neighbor_threshold: int = 5
+    isolated_decay_factor: float = 0.3
     minimum_tsdf_weight: float = 0.1
     # LOCAL PATCH (grocery_bot) #13: ESDF-seeding-only weight gate (see
     # MapperCfg.seed_tsdf_weight for full rationale).  Must be
@@ -242,6 +243,7 @@ class BlockSparseESDFIntegrator:
             occluder_margin=config.occluder_margin,
             isolated_w_protect=config.isolated_w_protect,
             isolated_neighbor_threshold=config.isolated_neighbor_threshold,
+            isolated_decay_factor=config.isolated_decay_factor,
             minimum_tsdf_weight=config.minimum_tsdf_weight,
             grid_shape=config.grid_shape,
             image_height=config.image_height,
