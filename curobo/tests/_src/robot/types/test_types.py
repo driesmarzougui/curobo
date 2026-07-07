@@ -292,6 +292,49 @@ class TestCSpaceParams:
         # Check that values are correctly reindexed
         assert torch.allclose(cspace.default_joint_position, torch.tensor([1.0, 3.0], **(cuda_device_cfg.as_torch_dict())))
 
+    def test_cspace_cfg_inplace_reindex_per_joint_position_limit_clip(self, cuda_device_cfg):
+        """itf-2026 patch #11: a per-joint position_limit_clip tensor must be reindexed too.
+
+        Upstream reindexed every other cspace field but not position_limit_clip, so locking a
+        joint (reindex to a subset) left the clip length mismatched with joint_limits["position"]
+        and raised at load. A full-length per-joint clip is reindexed; a scalar/broadcast clip is
+        left untouched (preserving the upstream broadcast contract).
+        """
+        joint_names = ["joint1", "joint2", "joint3", "joint4"]
+
+        # Full-length per-joint clip (List -> tensor in __post_init__): must shrink + reorder.
+        cspace = CSpaceParams(
+            joint_names=list(joint_names),
+            default_joint_position=torch.zeros(4, **(cuda_device_cfg.as_torch_dict())),
+            null_space_weight=torch.ones(4, **(cuda_device_cfg.as_torch_dict())),
+            cspace_distance_weight=torch.ones(4, **(cuda_device_cfg.as_torch_dict())),
+            position_limit_clip=[0.0, 0.1, 0.2, 0.3],
+            device_cfg=cuda_device_cfg,
+        )
+        cspace.inplace_reindex(["joint2", "joint4"])
+        assert isinstance(cspace.position_limit_clip, torch.Tensor)
+        assert cspace.position_limit_clip.shape == (2,)
+        assert torch.allclose(
+            cspace.position_limit_clip,
+            torch.tensor([0.1, 0.3], **(cuda_device_cfg.as_torch_dict())),
+        )
+
+        # Single-element broadcast clip: numel != joint count -> left untouched.
+        cspace_broadcast = CSpaceParams(
+            joint_names=list(joint_names),
+            default_joint_position=torch.zeros(4, **(cuda_device_cfg.as_torch_dict())),
+            null_space_weight=torch.ones(4, **(cuda_device_cfg.as_torch_dict())),
+            cspace_distance_weight=torch.ones(4, **(cuda_device_cfg.as_torch_dict())),
+            position_limit_clip=[0.05],
+            device_cfg=cuda_device_cfg,
+        )
+        cspace_broadcast.inplace_reindex(["joint2", "joint4"])
+        assert cspace_broadcast.position_limit_clip.numel() == 1
+        assert torch.allclose(
+            cspace_broadcast.position_limit_clip,
+            torch.tensor([0.05], **(cuda_device_cfg.as_torch_dict())),
+        )
+
     def test_cspace_cfg_with_max_acceleration(self, cuda_device_cfg):
         """Test CSpaceParams with max_acceleration parameter."""
         joint_names = ["joint1", "joint2"]

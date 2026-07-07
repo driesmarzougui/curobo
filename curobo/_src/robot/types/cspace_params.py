@@ -167,6 +167,17 @@ class CSpaceParams:
         self.velocity_scale = self.velocity_scale[new_index].clone()
         self.acceleration_scale = self.acceleration_scale[new_index].clone()
         self.jerk_scale = self.jerk_scale[new_index].clone()
+        # itf-2026 patch #11: reindex a per-joint `position_limit_clip` tensor alongside the
+        # other cspace fields so it survives `lock_joints` (e.g. locking the gripper finger
+        # shrinks joint_limits["position"] from N to N-1). Guard on numel == full joint count
+        # so scalar/broadcast clips (numel 1) are left untouched, preserving the upstream
+        # broadcast contract in `_update_joint_limits`. `self.joint_names` is still the full
+        # pre-reindex list here (reassigned below). See tasks/curobo_vendor_patches.md #11.
+        if (
+            isinstance(self.position_limit_clip, torch.Tensor)
+            and self.position_limit_clip.numel() == len(self.joint_names)
+        ):
+            self.position_limit_clip = self.position_limit_clip[new_index].clone()
         joint_names = [self.joint_names[n] for n in new_index]
         self.joint_names = joint_names
 
