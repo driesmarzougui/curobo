@@ -49,6 +49,7 @@ from curobo._src.perception.mapper.kernel.builder.builder_block_sparse_kernel im
 from curobo._src.perception.mapper.kernel.wp_decay import (
     decay_and_recycle,
     decay_frustum_aware_multi_sensor,
+    decay_isolated_voxels,  # LOCAL PATCH (grocery_bot) #3
 )
 from curobo._src.perception.mapper.kernel.wp_integrate_lidar_project import (
     LidarProjectIntegrator,
@@ -124,6 +125,12 @@ class BlockSparseTSDFIntegratorCfg:
     frustum_decay: float = 1.0  # 1.0 = no extra decay for in-view voxels
     time_decay: float = 1.0  # 1.0 = no time decay
     minimum_tsdf_weight: float = 0.1
+    # LOCAL PATCH (grocery_bot) #3: isolated-voxel sweep. Defaults are
+    # upstream-neutral (factor 1.0 = off); the grocery-bot VoxelUpdater
+    # enables it. See tasks/curobo_vendor_patches.md #3.
+    isolated_decay_factor: float = 1.0  # 1.0 = sweep disabled
+    isolated_w_protect: float = 1.0  # skip voxels with w > this (confirmed)
+    isolated_neighbor_threshold: int = 5  # decay iff occupied 26-nbrs <= this
     grid_shape: Tuple[int, int, int] = None
     roughness: float = 3.0  # Geometric complexity multiplier
     image_height: Optional[int] = None  # For buffer pre-allocation
@@ -616,7 +623,16 @@ class BlockSparseTSDFIntegrator:
         """Decay once for the union of all frusta in the current frame."""
         if self._frame_count <= 0:
             return
-        if self.config.time_decay >= 1.0 and self.config.frustum_decay >= 1.0:
+        # LOCAL PATCH (grocery_bot) #3: the isolated-voxel sweep runs in this
+        # method too, so it must NOT be short-circuited by the frustum/time
+        # early-return — otherwise setting only ``isolated_decay_factor < 1.0``
+        # (frustum/time left at 1.0, the natural A/B-tuning config) would
+        # silently disable the sweep.
+        if (
+            self.config.time_decay >= 1.0
+            and self.config.frustum_decay >= 1.0
+            and self.config.isolated_decay_factor >= 1.0
+        ):
             return
 
         camera_intrinsics = None
@@ -673,6 +689,23 @@ class BlockSparseTSDFIntegrator:
             frustum_decay=self.config.frustum_decay,
             num_blocks=num_blocks,
         )
+
+        # LOCAL PATCH (grocery_bot) #3: geometric isolated-voxel cleanup.
+        # The frustum-aware pass above only decays in-frustum blocks, so a
+        # single depth-noise spike freezes forever once the arm rotates
+        # away and blocks every plan. Sweep every allocated voxel and drain
+        # those with a sparse 26-neighbourhood; decay_isolated_voxels also
+        # recomputes block_sums + recycles fully-drained blocks this frame.
+        # See tasks/curobo_vendor_patches.md #3.
+        if self.config.isolated_decay_factor < 1.0 and num_blocks > 0:
+            decay_isolated_voxels(
+                self._tsdf,
+                isolated_decay_factor=self.config.isolated_decay_factor,
+                w_protect=self.config.isolated_w_protect,
+                w_occupied=self.config.minimum_tsdf_weight,
+                neighbor_threshold=self.config.isolated_neighbor_threshold,
+                num_blocks=num_blocks,
+            )
 
     def _integrate_lidar_frame(
         self,

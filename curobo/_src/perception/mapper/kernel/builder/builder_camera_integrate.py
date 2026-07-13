@@ -473,9 +473,18 @@ def make_camera_integrate_kernels(
                         sdf = depth - z_cam
                         if sdf >= -TRUNCATION_DIST:
                             sdf_clamped = wp.min(sdf, TRUNCATION_DIST)
-                            base_weight = compute_tsdf_weight(depth, VOXEL_SIZE)
-                            coverage = (fx * VOXEL_SIZE / z_cam) * (fy * VOXEL_SIZE / z_cam)
-                            weight = base_weight * wp.max(coverage, 1.0)
+                            # LOCAL PATCH (grocery_bot) #1: drop the coverage
+                            # multiplier. Upstream weights each hit by
+                            # max((fx·vs/z)·(fy·vs/z), 1). At our D415 depth
+                            # intrinsics (fx≈920, vs=0.04 m) that is ≈1350/z²
+                            # (×1350 @ 1 m, ×15000 @ 0.3 m), so a single
+                            # close-range depth-noise spike lands with an
+                            # essentially immortal weight and paints a phantom
+                            # voxel that block-level frustum decay cannot remove
+                            # once the arm rotates away. Weight each hit by the
+                            # base TSDF weight only. See
+                            # tasks/curobo_vendor_patches.md #1.
+                            weight = compute_tsdf_weight(depth, VOXEL_SIZE)
 
                             total_sw = total_sw + sdf_clamped * weight
                             total_w = total_w + weight

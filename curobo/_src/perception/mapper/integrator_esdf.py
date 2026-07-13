@@ -144,6 +144,10 @@ class BlockSparseESDFIntegratorCfg:
     frustum_decay: float = 0.5
     time_decay: float = 1.0
     minimum_tsdf_weight: float = 0.1
+    # LOCAL PATCH (grocery_bot) #3: isolated-voxel sweep (see integrator_tsdf).
+    isolated_decay_factor: float = 1.0  # 1.0 = sweep disabled
+    isolated_w_protect: float = 1.0
+    isolated_neighbor_threshold: int = 5
     blend_esdf: bool = False
     use_cuda_graph: bool = True
     grid_shape: Tuple[int, int, int] = None
@@ -356,6 +360,12 @@ class BlockSparseESDFIntegrator:
             frustum_decay=config.frustum_decay,
             time_decay=config.time_decay,
             minimum_tsdf_weight=config.minimum_tsdf_weight,
+            # LOCAL PATCH (grocery_bot) #3: forward the isolated-voxel-sweep
+            # knobs into the internal TSDF integrator, which owns the decay
+            # pass (_apply_frame_decay) that runs the sweep.
+            isolated_decay_factor=config.isolated_decay_factor,
+            isolated_w_protect=config.isolated_w_protect,
+            isolated_neighbor_threshold=config.isolated_neighbor_threshold,
             grid_shape=config.grid_shape,
             image_height=config.image_height,
             image_width=config.image_width,

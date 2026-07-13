@@ -122,6 +122,10 @@ class Mapper:
             frustum_decay=config.frustum_decay_factor,
             time_decay=config.decay_factor,
             minimum_tsdf_weight=config.minimum_tsdf_weight,
+            # LOCAL PATCH (grocery_bot) #3: isolated-voxel sweep.
+            isolated_decay_factor=config.isolated_decay_factor,
+            isolated_w_protect=config.isolated_w_protect,
+            isolated_neighbor_threshold=config.isolated_neighbor_threshold,
             grid_shape=config.grid_shape,
             enable_static=config.enable_static,
             static_obstacle_color=config.static_obstacle_color,

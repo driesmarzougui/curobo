@@ -86,6 +86,13 @@ class MapperCfg:
     # === Decay ===
     decay_factor: float = 1.0
     frustum_decay_factor: float = 1.0
+    # LOCAL PATCH (grocery_bot) #3: isolated-voxel sweep. Discards voxels
+    # with a sparse 26-neighbourhood (orphan phantoms out of every frustum).
+    # Defaults are upstream-neutral (factor 1.0 = off). See
+    # tasks/curobo_vendor_patches.md #3.
+    isolated_decay_factor: float = 1.0
+    isolated_w_protect: float = 1.0
+    isolated_neighbor_threshold: int = 5
 
     # === Block Storage ===
     #: Voxels per block edge. Supported values are 1 or powers of 2 in [2, 32]. See
@@ -226,6 +233,30 @@ class MapperCfg:
             raise ValueError(f"decay_factor must be in (0, 1]: {self.decay_factor}")
         if not (0.0 <= self.frustum_decay_factor <= 1.0):
             raise ValueError(f"frustum_decay_factor must be in (0, 1]: {self.frustum_decay_factor}")
+        # LOCAL PATCH (grocery_bot) #3
+        if not (0.0 < self.isolated_decay_factor <= 1.0):
+            raise ValueError(
+                f"isolated_decay_factor must be in (0, 1]: {self.isolated_decay_factor}"
+            )
+        # isolated_w_protect is a WEIGHT threshold, not a factor: voxels with
+        # w > this are skipped by the sweep. Post-patch-#1 the TSDF weight is
+        # ≈ the observation count (~1/hit, clamped to 1000), so a value like
+        # 100 sits well above any real accumulation and effectively disables
+        # weight-protection, leaving the neighbour-count gate as the sole
+        # discriminator. Must exceed minimum_tsdf_weight or the sweep is a
+        # no-op (every candidate already has w >= minimum_tsdf_weight).
+        if self.isolated_w_protect < 0.0:
+            raise ValueError(
+                f"isolated_w_protect must be >= 0: {self.isolated_w_protect}"
+            )
+        # 26-connected neighbourhood ⇒ at most 26 occupied neighbours; a
+        # threshold >= 26 would decay every non-protected voxel (including
+        # real geometry) every frame. Cap at 25 to keep the gate meaningful.
+        if not (0 <= self.isolated_neighbor_threshold <= 25):
+            raise ValueError(
+                "isolated_neighbor_threshold must be in [0, 25] "
+                f"(26-connected neighbourhood): {self.isolated_neighbor_threshold}"
+            )
 
         # Validate hash_load_factor
         if not (0.0 < self.hash_load_factor <= 1.0):

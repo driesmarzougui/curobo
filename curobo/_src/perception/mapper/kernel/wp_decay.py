@@ -104,6 +104,79 @@ def launch_recycle(tsdf, num_blocks: int | None = None):
 
 
 # =============================================================================
+# LOCAL PATCH (grocery_bot) #3: Isolated-Voxel Sweep
+# =============================================================================
+
+
+def decay_isolated_voxels(
+    tsdf,  # BlockSparseTSDF instance
+    *,
+    isolated_decay_factor: float,
+    w_protect: float = 1.0,
+    w_occupied: float = 0.1,
+    neighbor_threshold: int = 5,
+    num_blocks: int | None = None,
+) -> None:
+    """Decay voxels whose 26-neighbourhood is sparse (orphan phantoms).
+
+    Runs AFTER the frustum-aware decay as a final cleanup for phantoms in
+    permanently out-of-frustum regions — a single depth-noise spike that
+    allocated a block, after which the arm rotated away so block-level
+    frustum decay never touches it again. Voxels with
+    ``<= neighbor_threshold`` occupied 26-neighbours (``w > w_occupied``)
+    have their weight + weighted-sdf multiplied by ``isolated_decay_factor``;
+    confirmed geometry (``w > w_protect``) is skipped. No-op when the factor
+    is ``>= 1.0``.
+
+    Recomputes ``block_sums`` and recycles fully-drained blocks before
+    returning (the same recompute→recycle tail as :func:`decay_and_recycle`),
+    so a phantom whose weight falls below ``minimum_tsdf_weight`` is reclaimed
+    the same frame. NOT CUDA graph safe (dynamic launch dim + host readback);
+    call outside graph capture. See tasks/curobo_vendor_patches.md #3.
+    """
+    if isolated_decay_factor >= 1.0:
+        return
+
+    max_blocks = tsdf.config.max_blocks
+    n = num_blocks
+    if n is None:
+        n = int(tsdf.data.num_allocated.item())
+    n = min(int(n), max_blocks)
+    if n <= 0:
+        return
+
+    block_size = tsdf.kernels.block_size
+    data = tsdf.get_warp_data()
+    device, stream = get_warp_device_stream(tsdf.data.block_data)
+
+    wp.launch(
+        tsdf.kernels.decay_isolated_voxels_kernel,
+        dim=n * block_size**3,
+        inputs=[
+            data.num_allocated,
+            data.block_coords,
+            data.block_to_hash_slot,
+            data.block_data,
+            data.hash_table,
+            int(tsdf.config.hash_capacity),
+            float(isolated_decay_factor),
+            float(w_protect),
+            float(w_occupied),
+            int(neighbor_threshold),
+        ],
+        device=device,
+        stream=stream,
+    )
+
+    # Recompute per-block weight sums over the swept range and recycle any
+    # block the sweep fully drained (same tail as decay_and_recycle).
+    tsdf.data.block_sums[:n] = tsdf.data.block_data[:n, :, 1].sum(
+        dim=1, dtype=torch.float32
+    )
+    launch_recycle(tsdf, num_blocks=n)
+
+
+# =============================================================================
 # Frustum-Aware Decay API
 # =============================================================================
 

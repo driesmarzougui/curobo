@@ -79,8 +79,16 @@ def make_decay_kernels(
     image_height: int,
     image_width: int,
     free_list_push,
+    hash_lookup=None,
 ) -> dict[str, object]:
-    """Build TSDF weight-decay and block-recycling kernels."""
+    """Build TSDF weight-decay and block-recycling kernels.
+
+    ``hash_lookup`` is the block-key→pool-index Warp function from
+    :func:`make_hash_kernels`; it is closed over by the LOCAL PATCH
+    ``decay_isolated_voxels_kernel`` so it can query cross-block
+    neighbours. Passed explicitly (like ``free_list_push``) so Warp sees
+    it as a local closure binding at compile time.
+    """
     suffix = (
         f"bs{block_size}_cfg"
         f"{warp_constant_suffix(block_size, grid_shape, origin_xyz, voxel_size, num_cameras, image_height, image_width)}"
@@ -97,6 +105,11 @@ def make_decay_kernels(
     NUM_CAMERAS = wp.constant(wp.int32(num_cameras))
     IMAGE_HEIGHT = wp.constant(wp.int32(image_height))
     IMAGE_WIDTH = wp.constant(wp.int32(image_width))
+    # LOCAL PATCH (grocery_bot) #3: block-size-derived voxel counts used by
+    # the isolated-voxel sweep (block_size defaults to 4 upstream ⇒ 64
+    # voxels/block, NOT the 512 the v0.8-era hardcoded patch assumed).
+    BS2 = wp.constant(wp.int32(block_size * block_size))
+    VOXELS_PER_BLOCK = wp.constant(wp.int32(block_size * block_size * block_size))
 
     # BS^3-scaled empty-weight threshold, closure-captured per
     # specialization.
@@ -362,9 +375,145 @@ def make_decay_kernels(
         free_list_push(free_list, free_count, tid, max_blocks)
         wp.atomic_add(recycle_count, 0, wp.int32(1))
 
+    # =====================================================================
+    # LOCAL PATCH (grocery_bot) #3: Isolated-Voxel Sweep
+    # =====================================================================
+    #
+    # Upstream decay is block-level + frustum-only: a voxel outside every
+    # camera frustum is never decayed, so a single one-off depth-noise
+    # spike (specular highlight on the white CRX plastic, a stereo
+    # outlier surviving the 8-neighbour reject, a bad sample from a fast
+    # eye-in-hand sweep at a lagged camera pose) allocates a block and
+    # then freezes forever the instant the arm rotates away — blocking
+    # every subsequent plan.
+    #
+    # This sweep discards them geometrically: for every allocated voxel,
+    # count occupied 26-neighbours (cross-block via ``hash_lookup``) and
+    # multiply weight+sdf by ``isolated_decay`` when the count is
+    # ``<= neighbor_threshold``. Real surfaces at our 4 cm voxel size are
+    # thick in the ±TRUNCATION_DIST band (≥6 occupied neighbours even at
+    # a bottle-cap rim); noise voxels form 1-wide islands with ≤2. Two
+    # safety belts: ``old_w > w_protect`` skips confirmed geometry
+    # unconditionally, and ``old_w < w_occupied`` skips empty voxels
+    # (strict ``<`` matches the ``sample_voxel`` visibility predicate so a
+    # decayed singleton drops below the floor rather than sticking at it).
+    # See tasks/curobo_vendor_patches.md #3.
+
+    @warp_kernel(f"decay_isolated_voxels_kernel_{suffix}")
+    def decay_isolated_voxels_kernel(
+        num_allocated: wp.array(dtype=wp.int32),
+        block_coords: wp.array(dtype=wp.int32),
+        block_to_hash_slot: wp.array(dtype=wp.int32),
+        block_data: wp.array3d(dtype=wp.float16),
+        hash_table: wp.array(dtype=wp.int64),
+        hash_capacity: wp.int32,
+        isolated_decay: wp.float32,   # weight multiplier for isolated voxels
+        w_protect: wp.float32,        # skip voxels with w > this (confirmed)
+        w_occupied: wp.float32,       # neighbour counts as occupied iff w > this
+        neighbor_threshold: wp.int32,  # decay iff occupied_count <= this
+    ):
+        """Decay voxels whose 26-neighbourhood is sparse (orphan phantoms).
+
+        Launch with ``dim = num_blocks * block_size**3`` (num_blocks =
+        num_allocated). ``block_idx >= num_allocated[0]`` below is the sole
+        liveness bound — the launch dim never exceeds
+        ``num_allocated * VOXELS_PER_BLOCK``, so no max_blocks guard is needed.
+        """
+        tid = wp.tid()
+
+        block_idx = tid // VOXELS_PER_BLOCK
+        local_idx = tid % VOXELS_PER_BLOCK
+
+        if block_idx >= num_allocated[0]:
+            return
+        if block_to_hash_slot[block_idx] < 0:
+            return
+
+        old_w = wp.float32(block_data[block_idx, local_idx, 1])
+        if old_w < w_occupied:
+            return  # empty / effectively empty (matches sample_voxel)
+        if old_w > w_protect:
+            return  # confirmed geometry — safety belt
+
+        # Decompose local_idx = lz*BS² + ly*BS + lx.
+        lz = local_idx // BS2
+        rem = local_idx - lz * BS2
+        ly = rem // BLOCK_SIZE
+        lx = rem - ly * BLOCK_SIZE
+
+        bx = block_coords[block_idx * 3 + 0]
+        by = block_coords[block_idx * 3 + 1]
+        bz = block_coords[block_idx * 3 + 2]
+
+        n_occupied = wp.int32(0)
+
+        # 26-connected neighbourhood — {-1,0,1}³ skipping (0,0,0). Once the
+        # occupied count passes neighbor_threshold the voxel is preserved
+        # regardless, so skip the remaining probes — each is a cross-block
+        # hash_lookup + global read, and the dense-surface common case then
+        # costs ~(neighbor_threshold + 1) probes instead of the full 26.
+        for dx in range(-1, 2):
+            for dy in range(-1, 2):
+                for dz in range(-1, 2):
+                    if dx == 0 and dy == 0 and dz == 0:
+                        continue
+                    if n_occupied > neighbor_threshold:
+                        continue
+
+                    nlx = lx + dx
+                    nly = ly + dy
+                    nlz = lz + dz
+                    nbx = bx
+                    nby = by
+                    nbz = bz
+
+                    # Cross block boundary: local coord wraps by BLOCK_SIZE,
+                    # block-key coord steps by ±1.
+                    if nlx < 0:
+                        nlx = nlx + BLOCK_SIZE
+                        nbx = nbx - 1
+                    if nlx >= BLOCK_SIZE:
+                        nlx = nlx - BLOCK_SIZE
+                        nbx = nbx + 1
+                    if nly < 0:
+                        nly = nly + BLOCK_SIZE
+                        nby = nby - 1
+                    if nly >= BLOCK_SIZE:
+                        nly = nly - BLOCK_SIZE
+                        nby = nby + 1
+                    if nlz < 0:
+                        nlz = nlz + BLOCK_SIZE
+                        nbz = nbz - 1
+                    if nlz >= BLOCK_SIZE:
+                        nlz = nlz - BLOCK_SIZE
+                        nbz = nbz + 1
+
+                    neighbor_local_idx = nlz * BS2 + nly * BLOCK_SIZE + nlx
+
+                    if nbx == bx and nby == by and nbz == bz:
+                        neighbor_block_idx = block_idx
+                    else:
+                        neighbor_block_idx = hash_lookup(
+                            hash_table, nbx, nby, nbz, hash_capacity,
+                        )
+                        if neighbor_block_idx < 0:
+                            continue  # neighbour block not allocated → empty
+
+                    neighbor_w = wp.float32(
+                        block_data[neighbor_block_idx, neighbor_local_idx, 1]
+                    )
+                    if neighbor_w > w_occupied:
+                        n_occupied = n_occupied + 1
+
+        if n_occupied <= neighbor_threshold:
+            old_sw = wp.float32(block_data[block_idx, local_idx, 0])
+            block_data[block_idx, local_idx, 0] = wp.float16(old_sw * isolated_decay)
+            block_data[block_idx, local_idx, 1] = wp.float16(old_w * isolated_decay)
+
     return {
         "mark_blocks_in_frustum_kernel": mark_blocks_in_frustum_kernel,
         "mark_lidar_blocks_in_frustum_kernel": mark_lidar_blocks_in_frustum_kernel,
         "recycle_empty_blocks_kernel": recycle_empty_blocks_kernel,
+        "decay_isolated_voxels_kernel": decay_isolated_voxels_kernel,
         "block_empty_threshold": block_empty_threshold,
     }
