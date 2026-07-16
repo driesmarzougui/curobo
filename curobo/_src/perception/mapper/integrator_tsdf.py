@@ -48,6 +48,7 @@ from curobo._src.perception.mapper.kernel.builder.builder_block_sparse_kernel im
 )
 from curobo._src.perception.mapper.kernel.wp_decay import (
     decay_and_recycle,
+    decay_carve_free_space,  # LOCAL PATCH (grocery_bot) #2
     decay_frustum_aware_multi_sensor,
     decay_isolated_voxels,  # LOCAL PATCH (grocery_bot) #3
 )
@@ -131,6 +132,16 @@ class BlockSparseTSDFIntegratorCfg:
     isolated_decay_factor: float = 1.0  # 1.0 = sweep disabled
     isolated_w_protect: float = 1.0  # skip voxels with w > this (confirmed)
     isolated_neighbor_threshold: int = 5  # decay iff occupied 26-nbrs <= this
+    # LOCAL PATCH (grocery_bot) #2 (single-camera): free-space carving.
+    # Evidence-based decay that replaces block-level frustum decay. Defaults
+    # upstream-neutral (carve_decay_factor 1.0 = off); the grocery-bot
+    # VoxelUpdater enables it. See tasks/curobo_vendor_patches.md #2/#5/#6.
+    carve_decay_factor: float = 1.0        # weight ×factor for carved voxels; 1.0 = off
+    carve_free_space_margin: float = 0.15  # m past z_cam a reading must be to carve
+    carve_w_threshold: float = 0.6         # exposed no-info voxels below this are drained
+    carve_sanity_max_depth_m: float = 10.0  # patch #5: free-space validity cap
+    carve_novote_soft_decay: float = 1.0   # patch #6: confirmed no-info drain; 1.0 = strict preserve
+    carve_w_cap: float = 20.0              # per-voxel weight ceiling (bounds fp16 growth once frustum decay retired)
     grid_shape: Tuple[int, int, int] = None
     roughness: float = 3.0  # Geometric complexity multiplier
     image_height: Optional[int] = None  # For buffer pre-allocation
@@ -632,6 +643,11 @@ class BlockSparseTSDFIntegrator:
             self.config.time_decay >= 1.0
             and self.config.frustum_decay >= 1.0
             and self.config.isolated_decay_factor >= 1.0
+            # LOCAL PATCH (grocery_bot) #2: don't short-circuit when only the
+            # carve knobs are active (the natural frustum-off A/B config) —
+            # else free-space carving would silently no-op.
+            and self.config.carve_decay_factor >= 1.0
+            and self.config.carve_novote_soft_decay >= 1.0
         ):
             return
 
@@ -689,6 +705,37 @@ class BlockSparseTSDFIntegrator:
             frustum_decay=self.config.frustum_decay,
             num_blocks=num_blocks,
         )
+
+        # LOCAL PATCH (grocery_bot) #2: free-space carving (single-camera).
+        # Evidence-based per-voxel decay — the primary removal mechanism that
+        # replaces block-level frustum decay (frustum_decay defaults to 1.0
+        # now). Runs BEFORE the isolated sweep: carve removes dense phantoms
+        # the camera sees through, isolated then mops up sparse orphans carve
+        # can't reach (permanently out-of-frustum / no-info singletons).
+        # No-op unless a carve knob is active. See curobo_vendor_patches.md #2.
+        if (
+            camera_observation is not None
+            and num_blocks > 0
+            and (
+                self.config.carve_decay_factor < 1.0
+                or self.config.carve_novote_soft_decay < 1.0
+            )
+        ):
+            decay_carve_free_space(
+                self._tsdf,
+                camera_intrinsics=camera_intrinsics,
+                camera_positions=camera_positions,
+                camera_quaternions=camera_quaternions,
+                camera_depth_images=camera_observation.depth_image,
+                depth_minimum_distance=self.config.depth_minimum_distance,
+                carve_sanity_max_depth_m=self.config.carve_sanity_max_depth_m,
+                carve_free_space_margin=self.config.carve_free_space_margin,
+                carve_decay_factor=self.config.carve_decay_factor,
+                carve_w_threshold=self.config.carve_w_threshold,
+                carve_novote_soft_decay=self.config.carve_novote_soft_decay,
+                carve_w_cap=self.config.carve_w_cap,
+                num_blocks=num_blocks,
+            )
 
         # LOCAL PATCH (grocery_bot) #3: geometric isolated-voxel cleanup.
         # The frustum-aware pass above only decays in-frustum blocks, so a

@@ -94,6 +94,18 @@ class MapperCfg:
     isolated_w_protect: float = 1.0
     isolated_neighbor_threshold: int = 5
 
+    # LOCAL PATCH (grocery_bot) #2: free-space carving (single-camera re-port).
+    # Evidence-based per-voxel decay that replaces block-level frustum decay
+    # as the primary forgetting mechanism (so occluded-but-real voxels survive
+    # and the D415 can be un-muted). Defaults upstream-neutral (carve_decay_
+    # factor 1.0 = off). See tasks/curobo_vendor_patches.md #2/#5/#6.
+    carve_decay_factor: float = 1.0        # weight ×factor for carved voxels; 1.0 = off
+    carve_free_space_margin: float = 0.15  # m past z_cam a reading must be to carve
+    carve_w_threshold: float = 0.6         # exposed no-info voxels below this are drained
+    carve_sanity_max_depth_m: float = 10.0  # patch #5: free-space validity cap
+    carve_novote_soft_decay: float = 1.0   # patch #6: confirmed no-info drain; 1.0 = strict preserve
+    carve_w_cap: float = 20.0              # per-voxel weight ceiling (bounds fp16 growth)
+
     # === Block Storage ===
     #: Voxels per block edge. Supported values are 1 or powers of 2 in [2, 32]. See
     #: :class:`~curobo._src.perception.mapper.kernel.builder.builder_block_sparse_kernel.BlockSparseKernels`.
@@ -256,6 +268,34 @@ class MapperCfg:
             raise ValueError(
                 "isolated_neighbor_threshold must be in [0, 25] "
                 f"(26-connected neighbourhood): {self.isolated_neighbor_threshold}"
+            )
+
+        # LOCAL PATCH (grocery_bot) #2: free-space carving
+        if not (0.0 < self.carve_decay_factor <= 1.0):
+            raise ValueError(
+                f"carve_decay_factor must be in (0, 1]: {self.carve_decay_factor}"
+            )
+        if not (0.0 < self.carve_novote_soft_decay <= 1.0):
+            raise ValueError(
+                f"carve_novote_soft_decay must be in (0, 1]: {self.carve_novote_soft_decay}"
+            )
+        if self.carve_free_space_margin <= 0.0:
+            raise ValueError(
+                f"carve_free_space_margin must be > 0: {self.carve_free_space_margin}"
+            )
+        if self.carve_w_threshold <= 0.0:
+            raise ValueError(
+                f"carve_w_threshold must be > 0: {self.carve_w_threshold}"
+            )
+        if self.carve_sanity_max_depth_m <= self.depth_minimum_distance:
+            raise ValueError(
+                "carve_sanity_max_depth_m must be > depth_minimum_distance: "
+                f"{self.carve_sanity_max_depth_m} <= {self.depth_minimum_distance}"
+            )
+        if self.carve_w_cap <= self.minimum_tsdf_weight:
+            raise ValueError(
+                "carve_w_cap must be > minimum_tsdf_weight: "
+                f"{self.carve_w_cap} <= {self.minimum_tsdf_weight}"
             )
 
         # Validate hash_load_factor

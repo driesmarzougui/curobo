@@ -108,6 +108,7 @@ class BlockSparseKernels:
     mark_lidar_blocks_in_frustum_kernel: WarpKernel
     recycle_empty_blocks_kernel: WarpKernel
     decay_isolated_voxels_kernel: WarpKernel  # LOCAL PATCH (grocery_bot) #3
+    decay_carve_free_space_kernel: WarpKernel  # LOCAL PATCH (grocery_bot) #2
     block_empty_threshold: Any
 
     preallocate_unique_blocks_kernel: WarpKernel
@@ -440,6 +441,7 @@ def make_block_sparse_kernels(
         image_width=resolved_image_width,
         free_list_push=hash_exports["free_list_push"],
         hash_lookup=hash_exports["hash_lookup"],
+        block_local_to_world=coord_exports["block_local_to_world"],
     )
     stamp_exports = make_stamp_kernels(
         resolved_block_size,

@@ -148,6 +148,13 @@ class BlockSparseESDFIntegratorCfg:
     isolated_decay_factor: float = 1.0  # 1.0 = sweep disabled
     isolated_w_protect: float = 1.0
     isolated_neighbor_threshold: int = 5
+    # LOCAL PATCH (grocery_bot) #2: free-space carving (see integrator_tsdf).
+    carve_decay_factor: float = 1.0
+    carve_free_space_margin: float = 0.15
+    carve_w_threshold: float = 0.6
+    carve_sanity_max_depth_m: float = 10.0
+    carve_novote_soft_decay: float = 1.0
+    carve_w_cap: float = 20.0
     blend_esdf: bool = False
     use_cuda_graph: bool = True
     grid_shape: Tuple[int, int, int] = None
@@ -366,6 +373,13 @@ class BlockSparseESDFIntegrator:
             isolated_decay_factor=config.isolated_decay_factor,
             isolated_w_protect=config.isolated_w_protect,
             isolated_neighbor_threshold=config.isolated_neighbor_threshold,
+            # LOCAL PATCH (grocery_bot) #2: forward free-space-carving knobs.
+            carve_decay_factor=config.carve_decay_factor,
+            carve_free_space_margin=config.carve_free_space_margin,
+            carve_w_threshold=config.carve_w_threshold,
+            carve_sanity_max_depth_m=config.carve_sanity_max_depth_m,
+            carve_novote_soft_decay=config.carve_novote_soft_decay,
+            carve_w_cap=config.carve_w_cap,
             grid_shape=config.grid_shape,
             image_height=config.image_height,
             image_width=config.image_width,

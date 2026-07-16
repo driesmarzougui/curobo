@@ -177,6 +177,108 @@ def decay_isolated_voxels(
 
 
 # =============================================================================
+# LOCAL PATCH (grocery_bot) #2: Free-Space Carving (single-camera re-port)
+# =============================================================================
+
+
+def decay_carve_free_space(
+    tsdf,  # BlockSparseTSDF instance
+    *,
+    camera_intrinsics: torch.Tensor,
+    camera_positions: torch.Tensor,
+    camera_quaternions: torch.Tensor,
+    camera_depth_images: torch.Tensor,
+    depth_minimum_distance: float,
+    carve_sanity_max_depth_m: float,
+    carve_free_space_margin: float,
+    carve_decay_factor: float,
+    carve_w_threshold: float,
+    carve_novote_soft_decay: float,
+    carve_w_cap: float,
+    num_blocks: int | None = None,
+) -> None:
+    """Evidence-based free-space-carving decay (LOCAL PATCH #2, single-camera).
+
+    Reprojects each allocated voxel into the camera depth image(s) and decays
+    only voxels the camera sees *through* (valid depth measurably past them) or
+    exposed-but-unconfirmed no-info voxels; preserves occluded / near-surface /
+    out-of-frustum voxels. Replaces block-level frustum decay as the primary
+    forgetting mechanism (which is why it is safe to un-mute — occluded-real
+    geometry is preserved). Recomputes ``block_sums`` + recycles fully-drained
+    blocks, same tail as :func:`decay_isolated_voxels`. NOT CUDA graph safe
+    (dynamic launch dim + host readback); call outside graph capture.
+    No-op when ``carve_decay_factor >= 1.0`` and ``carve_novote_soft_decay
+    >= 1.0`` (nothing would decay). See tasks/curobo_vendor_patches.md #2/#5/#6.
+    """
+    if carve_decay_factor >= 1.0 and carve_novote_soft_decay >= 1.0:
+        return
+    if camera_intrinsics is None:
+        return
+
+    max_blocks = tsdf.config.max_blocks
+    n = num_blocks
+    if n is None:
+        n = int(tsdf.data.num_allocated.item())
+    n = min(int(n), max_blocks)
+    if n <= 0:
+        return
+
+    kernels = tsdf.kernels
+    n_cameras = int(camera_intrinsics.shape[0])
+    if n_cameras != kernels.num_cameras:
+        log_and_raise(
+            f"carve camera_intrinsics num_cameras={n_cameras} does not match "
+            f"compiled kernel num_cameras={kernels.num_cameras}."
+        )
+    img_H, img_W = int(camera_depth_images.shape[1]), int(camera_depth_images.shape[2])
+    if img_H != kernels.image_height or img_W != kernels.image_width:
+        log_and_raise(
+            f"carve depth image shape={(img_H, img_W)} does not match compiled "
+            f"kernel image shape={(kernels.image_height, kernels.image_width)}."
+        )
+    check_float32_tensors(
+        camera_intrinsics.device,
+        camera_intrinsics=camera_intrinsics,
+        camera_positions=camera_positions,
+        camera_quaternions=camera_quaternions,
+        camera_depth_images=camera_depth_images,
+    )
+
+    block_size = kernels.block_size
+    data = tsdf.get_warp_data()
+    device, stream = get_warp_device_stream(tsdf.data.block_data)
+
+    wp.launch(
+        kernels.decay_carve_free_space_kernel,
+        dim=n * block_size**3,
+        inputs=[
+            data.num_allocated,
+            data.block_coords,
+            data.block_to_hash_slot,
+            data.block_data,
+            wp.from_torch(camera_intrinsics, dtype=wp.float32),
+            wp.from_torch(camera_positions, dtype=wp.float32),
+            wp.from_torch(camera_quaternions, dtype=wp.float32),
+            wp.from_torch(camera_depth_images, dtype=wp.float32),
+            float(depth_minimum_distance),
+            float(carve_sanity_max_depth_m),
+            float(carve_free_space_margin),
+            float(carve_decay_factor),
+            float(carve_w_threshold),
+            float(carve_novote_soft_decay),
+            float(carve_w_cap),
+        ],
+        device=device,
+        stream=stream,
+    )
+
+    tsdf.data.block_sums[:n] = tsdf.data.block_data[:n, :, 1].sum(
+        dim=1, dtype=torch.float32
+    )
+    launch_recycle(tsdf, num_blocks=n)
+
+
+# =============================================================================
 # Frustum-Aware Decay API
 # =============================================================================
 

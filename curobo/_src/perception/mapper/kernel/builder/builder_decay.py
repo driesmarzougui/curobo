@@ -80,14 +80,19 @@ def make_decay_kernels(
     image_width: int,
     free_list_push,
     hash_lookup=None,
+    block_local_to_world=None,
 ) -> dict[str, object]:
     """Build TSDF weight-decay and block-recycling kernels.
 
     ``hash_lookup`` is the block-key→pool-index Warp function from
     :func:`make_hash_kernels`; it is closed over by the LOCAL PATCH
     ``decay_isolated_voxels_kernel`` so it can query cross-block
-    neighbours. Passed explicitly (like ``free_list_push``) so Warp sees
-    it as a local closure binding at compile time.
+    neighbours. ``block_local_to_world`` is the per-voxel world-position
+    Warp func from :func:`make_coord_kernels`; the LOCAL PATCH
+    ``decay_carve_free_space_kernel`` closes over it to reproject each
+    voxel onto the *same* pixel the integrator wrote. Both are passed
+    explicitly (like ``free_list_push``) so Warp sees them as local
+    closure bindings at compile time.
     """
     suffix = (
         f"bs{block_size}_cfg"
@@ -510,10 +515,148 @@ def make_decay_kernels(
             block_data[block_idx, local_idx, 0] = wp.float16(old_sw * isolated_decay)
             block_data[block_idx, local_idx, 1] = wp.float16(old_w * isolated_decay)
 
+    # =====================================================================
+    # LOCAL PATCH (grocery_bot) #2 (single-camera re-port): Free-Space Carving
+    # =====================================================================
+    #
+    # Evidence-based forgetting, the physically-correct replacement for
+    # block-level frustum decay (which multiplies EVERY in-frustum voxel,
+    # eroding occluded-but-real geometry — the "scene disappears at the
+    # close-up / during motion" symptom, hence frustum_decay is now 1.0).
+    #
+    # Per allocated voxel, reproject its centre into each camera's depth
+    # image (same block_local_to_world + projection the integrator uses, so
+    # it lands on the same pixel) and vote:
+    #   • valid depth measurably PAST the voxel (> z_cam + margin) → decay
+    #       (free-space evidence: the camera sees through this voxel)
+    #   • valid depth near/behind the voxel                        → preserve
+    #       (the voxel is at/behind a real surface — occluded-but-real)
+    #   • NOT projected into any frustum                           → preserve
+    #       (out of view carries no evidence — THIS is what lets us un-mute)
+    #   • projected but depth invalid (0/self-masked/≥sanity)      → no-vote:
+    #       low-weight (< w_threshold) → decay (unconfirmed phantom);
+    #       confirmed (≥ w_threshold)  → preserve, or ×novote_soft_decay if <1.
+    # Multi-camera would OR the votes (preserve wins, else decay); with the
+    # single wrist D415 (num_cameras==1) that collapses to the one camera's
+    # vote. A robot occluder never wrongly carves: the arm pixel reads depth
+    # < z_cam (→ preserve) or is segmenter-zeroed (→ no-vote), so patch #12's
+    # occluder-sphere test is unnecessary here. ``w_cap`` bounds additive
+    # weight growth on the preserve branches (retiring frustum decay removed
+    # the only cap) and caps carve-out latency. Both channels scale together,
+    # so the SDF estimate sw/w is invariant under decay/cap. See
+    # tasks/curobo_vendor_patches.md #2/#5/#6.
+
+    @warp_kernel(f"decay_carve_free_space_kernel_{suffix}")
+    def decay_carve_free_space_kernel(
+        num_allocated: wp.array(dtype=wp.int32),
+        block_coords: wp.array(dtype=wp.int32),
+        block_to_hash_slot: wp.array(dtype=wp.int32),
+        block_data: wp.array3d(dtype=wp.float16),
+        intrinsics: wp.array3d(dtype=wp.float32),
+        cam_positions: wp.array2d(dtype=wp.float32),
+        cam_quaternions: wp.array2d(dtype=wp.float32),
+        depth_images: wp.array3d(dtype=wp.float32),
+        depth_min: wp.float32,
+        sanity_max_depth: wp.float32,
+        free_space_margin: wp.float32,
+        carve_decay: wp.float32,
+        w_threshold: wp.float32,
+        novote_soft_decay: wp.float32,
+        w_cap: wp.float32,
+    ):
+        """Free-space-carving decay. Launch ``dim = num_blocks * block_size**3``."""
+        tid = wp.tid()
+        block_idx = tid // VOXELS_PER_BLOCK
+        local_idx = tid % VOXELS_PER_BLOCK
+
+        if block_idx >= num_allocated[0]:
+            return
+        if block_to_hash_slot[block_idx] < 0:
+            return
+
+        old_w = wp.float32(block_data[block_idx, local_idx, 1])
+        if old_w <= 0.0:
+            return  # empty voxel — nothing to carve
+
+        bx = block_coords[block_idx * 3 + 0]
+        by = block_coords[block_idx * 3 + 1]
+        bz = block_coords[block_idx * 3 + 2]
+        voxel_world = block_local_to_world(bx, by, bz, local_idx)
+
+        exposed = wp.int32(0)
+        decay_vote = wp.int32(0)
+        preserve_vote = wp.int32(0)
+
+        for cam_i in range(num_cameras):
+            cam_pos = wp.vec3(
+                cam_positions[cam_i, 0],
+                cam_positions[cam_i, 1],
+                cam_positions[cam_i, 2],
+            )
+            cam_quat = wp.quaternion(
+                cam_quaternions[cam_i, 1],
+                cam_quaternions[cam_i, 2],
+                cam_quaternions[cam_i, 3],
+                cam_quaternions[cam_i, 0],
+            )
+            voxel_cam = wp.quat_rotate(wp.quat_inverse(cam_quat), voxel_world - cam_pos)
+            z_cam = voxel_cam[2]
+            if z_cam > depth_min:
+                fx = intrinsics[cam_i, 0, 0]
+                fy = intrinsics[cam_i, 1, 1]
+                cx_i = intrinsics[cam_i, 0, 2]
+                cy_i = intrinsics[cam_i, 1, 2]
+                u = fx * voxel_cam[0] / z_cam + cx_i
+                v = fy * voxel_cam[1] / z_cam + cy_i
+                px = wp.int32(u)
+                py = wp.int32(v)
+                if px >= 0 and px < IMAGE_WIDTH and py >= 0 and py < IMAGE_HEIGHT:
+                    exposed = wp.int32(1)
+                    depth = depth_images[cam_i, py, px]
+                    if depth >= depth_min and depth < sanity_max_depth:
+                        if depth > z_cam + free_space_margin:
+                            decay_vote = wp.int32(1)   # free space past voxel
+                        else:
+                            preserve_vote = wp.int32(1)  # near/behind surface
+                    # else: invalid depth → no vote from this camera
+
+        old_sw = wp.float32(block_data[block_idx, local_idx, 0])
+
+        # PRESERVE: near/behind a real surface in some camera → keep. Cap only.
+        if preserve_vote == wp.int32(1):
+            if old_w > w_cap:
+                scale = w_cap / old_w
+                block_data[block_idx, local_idx, 0] = wp.float16(old_sw * scale)
+                block_data[block_idx, local_idx, 1] = wp.float16(w_cap)
+            return
+        # OUT OF FRUSTUM: no camera saw it → no evidence → keep (enables un-mute).
+        if exposed == wp.int32(0):
+            return
+        # FREE-SPACE EVIDENCE: a camera saw through this voxel → carve.
+        if decay_vote == wp.int32(1):
+            block_data[block_idx, local_idx, 0] = wp.float16(old_sw * carve_decay)
+            block_data[block_idx, local_idx, 1] = wp.float16(old_w * carve_decay)
+            return
+        # EXPOSED, NO-INFO (invalid depth at the pixel):
+        if old_w < w_threshold:
+            # unconfirmed → treat as phantom, drain
+            block_data[block_idx, local_idx, 0] = wp.float16(old_sw * carve_decay)
+            block_data[block_idx, local_idx, 1] = wp.float16(old_w * carve_decay)
+            return
+        # confirmed no-info → strict preserve (default), or soft-drain if enabled
+        if novote_soft_decay < 1.0:
+            block_data[block_idx, local_idx, 0] = wp.float16(old_sw * novote_soft_decay)
+            block_data[block_idx, local_idx, 1] = wp.float16(old_w * novote_soft_decay)
+        elif old_w > w_cap:
+            scale = w_cap / old_w
+            block_data[block_idx, local_idx, 0] = wp.float16(old_sw * scale)
+            block_data[block_idx, local_idx, 1] = wp.float16(w_cap)
+
     return {
         "mark_blocks_in_frustum_kernel": mark_blocks_in_frustum_kernel,
         "mark_lidar_blocks_in_frustum_kernel": mark_lidar_blocks_in_frustum_kernel,
         "recycle_empty_blocks_kernel": recycle_empty_blocks_kernel,
         "decay_isolated_voxels_kernel": decay_isolated_voxels_kernel,
+        "decay_carve_free_space_kernel": decay_carve_free_space_kernel,
         "block_empty_threshold": block_empty_threshold,
     }

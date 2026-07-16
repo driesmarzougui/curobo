@@ -126,6 +126,13 @@ class Mapper:
             isolated_decay_factor=config.isolated_decay_factor,
             isolated_w_protect=config.isolated_w_protect,
             isolated_neighbor_threshold=config.isolated_neighbor_threshold,
+            # LOCAL PATCH (grocery_bot) #2: free-space carving.
+            carve_decay_factor=config.carve_decay_factor,
+            carve_free_space_margin=config.carve_free_space_margin,
+            carve_w_threshold=config.carve_w_threshold,
+            carve_sanity_max_depth_m=config.carve_sanity_max_depth_m,
+            carve_novote_soft_decay=config.carve_novote_soft_decay,
+            carve_w_cap=config.carve_w_cap,
             grid_shape=config.grid_shape,
             enable_static=config.enable_static,
             static_obstacle_color=config.static_obstacle_color,
